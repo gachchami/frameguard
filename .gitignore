@@ -1,0 +1,77 @@
+# Python & Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Dependencies
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+.eggs/
+build/
+dist/
+eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+
+# Pytorch & Data
+*.pt
+*.pth
+*.tar
+*.ckpt
+dataset/
+data/
+downloads/
+download/
+*.model
+*.weights
+
+# IDE & OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Docker & Container
+.dockerignore
+*.env
+docker-compose.override.yml
+docker-compose.prod.yml
+
+# FastAPI & Streamlit
+.cache/
+.streamlit/credentials.toml
+.streamlit/config.toml
+*.log
+*.sqlite
+*.db
+local_db/
+uploads/
+
+
+# Hardware & Build Artifacts (AMD ROCm / CUDA)
+.cache/rocprofiler/
+.cache/miopen/
+.cache/torch/
+.pytest_cache/
+*.isa
+*.hsaco
+*.bin
