@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from dataclasses import dataclass
-import re
 
 import cv2
 import numpy as np
@@ -34,7 +34,9 @@ def _preprocess(frame: np.ndarray) -> tuple[np.ndarray, float]:
     return cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB), scale
 
 
-def _tokens_by_line(frame: np.ndarray, min_confidence: float = 20.0) -> tuple[list[list[OCRToken]], float]:
+def _tokens_by_line(
+    frame: np.ndarray, min_confidence: float = 20.0
+) -> tuple[list[list[OCRToken]], float]:
     image, scale = _preprocess(frame)
     data = pytesseract.image_to_data(image, output_type=Output.DICT, config="--oem 3 --psm 11")
     lines: dict[tuple[int, int, int], list[OCRToken]] = defaultdict(list)
