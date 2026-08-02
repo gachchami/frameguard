@@ -52,59 +52,213 @@ class QwenOmniClient:
         response = httpx.get(f"{base}/health", timeout=10.0)
         response.raise_for_status()
 
-    def analyze_clip(self, clip_path: str | Path, clip_duration_seconds: float) -> LLMResponse:
-        clip_path = Path(clip_path)
-        content = [
-            {
-                "type": "video_url",
-                "video_url": {"url": _data_uri(clip_path)},
-            },
-            {"type": "text", "text": DETECTION_PROMPT},
-        ]
-        thinker_sampling: dict[str, Any] = {
-            "temperature": 0.0,
-            "top_p": 1.0,
-            "top_k": -1,
-            "max_tokens": 1400,
-            "seed": 42,
-            "detokenize": True,
-            "repetition_penalty": 1.05,
-        }
-        payload: dict[str, Any] = {
-            "model": self.model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": [{"type": "text", "text": SYSTEM_PROMPT}],
-                },
-                {"role": "user", "content": content},
-            ],
-            "modalities": ["text"],
-            "mm_processor_kwargs": {"use_audio_in_video": True},
-            "sampling_params_list": [thinker_sampling, thinker_sampling, thinker_sampling],
-        }
+    def analyze_clip(
+        self,
+        clip_path: str | Path,
+        clip_duration_seconds: float,
+    ) -> LLMResponse:
+        """Analyze one video chunk using Qwen2.5-Omni.
 
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
-        with httpx.Client(timeout=self.timeout_seconds) as client:
-            response = client.post(
-                f"{self.api_base}/chat/completions",
-                headers=headers,
-                json=payload,
+        The video and its extracted audio are sent as separate multimodal
+        inputs. This avoids relying on the V0-only embedded-audio-in-video path.
+        """
+
+        clip_path = Path(clip_path).resolve()
+
+        if not clip_path.exists():
+            raise FileNotFoundError(f"Video clip does not exist: {clip_path}")
+
+        if clip_path.stat().st_size == 0:
+            raise ValueError(f"Video clip is empty: {clip_path}")
+
+        with tempfile.TemporaryDirectory(
+            prefix="frameguard_audio_",
+        ) as temporary_directory:
+            audio_path = Path(temporary_directory) / f"{clip_path.stem}.wav"
+
+            # Extract the first audio stream as a mono, 16 kHz PCM WAV.
+            #
+            # The trailing ? in 0:a:0? makes the audio stream optional.
+            # This lets FrameGuard continue with video-only clips.
+            ffmpeg_command = [
+                "ffmpeg",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                str(clip_path),
+                "-map",
+                "0:a:0?",
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-c:a",
+                "pcm_s16le",
+                str(audio_path),
+            ]
+
+            ffmpeg_result = subprocess.run(
+                ffmpeg_command,
+                capture_output=True,
+                text=True,
+                check=False,
             )
-        if response.is_error:
-            detail = response.text[-2000:]
-            raise RuntimeError(f"Qwen Omni server returned {response.status_code}: {detail}")
 
-        body = response.json()
-        choices = body.get("choices", [])
-        if not choices:
-            raise RuntimeError(f"Qwen Omni response contained no choices: {body}")
-        raw_text = str(choices[0].get("message", {}).get("content", ""))
-        findings = parse_model_findings(raw_text, clip_duration_seconds)
-        return LLMResponse(findings=findings, raw_text=raw_text)
+            audio_available = (
+                ffmpeg_result.returncode == 0
+                and audio_path.exists()
+                and audio_path.stat().st_size > 44
+            )
+
+            # Start with the visual video input.
+            content: list[dict[str, Any]] = [
+                {
+                    "type": "video_url",
+                    "video_url": {
+                        "url": _data_uri(clip_path),
+                    },
+                }
+            ]
+
+            # Add the audio as a separate input when the video has audio.
+            if audio_available:
+                content.append(
+                    {
+                        "type": "audio_url",
+                        "audio_url": {
+                            "url": _data_uri(audio_path),
+                        },
+                    }
+                )
+
+            content.append(
+                {
+                    "type": "text",
+                    "text": DETECTION_PROMPT,
+                }
+            )
+
+            # This is a plain-vLLM request.
+            #
+            # Do not include:
+            # - modalities
+            # - sampling_params_list
+            # - mm_processor_kwargs/use_audio_in_video
+            #
+            # Those belong to other serving paths and were ignored by the
+            # current plain-vLLM server.
+            payload: dict[str, Any] = {
+                "model": self.model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": SYSTEM_PROMPT,
+                            }
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": content,
+                    },
+                ],
+                "temperature": 0.0,
+                "top_p": 1.0,
+                "max_tokens": 1400,
+                "seed": 42,
+                "repetition_penalty": 1.05,
+            }
+
+            headers = {
+                "Content-Type": "application/json",
+            }
+
+            if self.api_key:
+                headers["Authorization"] = f"Bearer {self.api_key}"
+
+            endpoint = f"{self.api_base.rstrip('/')}/chat/completions"
+
+            try:
+                with httpx.Client(
+                    timeout=self.timeout_seconds,
+                ) as client:
+                    response = client.post(
+                        endpoint,
+                        headers=headers,
+                        json=payload,
+                    )
+            except httpx.ConnectError as exc:
+                raise RuntimeError(
+                    "Could not connect to the Qwen model server at "
+                    f"{self.api_base}. Confirm that vLLM is running."
+                ) from exc
+            except httpx.TimeoutException as exc:
+                raise RuntimeError(
+                    f"The Qwen model request timed out after {self.timeout_seconds} seconds."
+                ) from exc
+
+            if response.is_error:
+                raise RuntimeError(
+                    f"Qwen server returned HTTP {response.status_code}: {response.text[-4000:]}"
+                )
+
+            try:
+                body = response.json()
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"Qwen server returned a non-JSON response: {response.text[-4000:]}"
+                ) from exc
+
+            if "error" in body:
+                raise RuntimeError(f"Qwen server returned an internal error: {body['error']}")
+
+            choices = body.get("choices")
+
+            if not choices:
+                raise RuntimeError(f"Qwen response contained no choices: {body}")
+
+            message = choices[0].get("message", {})
+            message_content = message.get("content", "")
+
+            # Most vLLM responses return content as a string. This also
+            # supports OpenAI-style content-part lists.
+            if isinstance(message_content, str):
+                raw_text = message_content
+            elif isinstance(message_content, list):
+                text_parts: list[str] = []
+
+                for part in message_content:
+                    if isinstance(part, str):
+                        text_parts.append(part)
+                    elif isinstance(part, dict):
+                        part_text = part.get("text")
+
+                        if isinstance(part_text, str):
+                            text_parts.append(part_text)
+
+                raw_text = "\n".join(text_parts)
+            else:
+                raw_text = str(message_content)
+
+            raw_text = raw_text.strip()
+
+            if not raw_text:
+                raise RuntimeError(f"Qwen returned an empty message. Full response: {body}")
+
+            findings = parse_model_findings(
+                raw_text,
+                clip_duration_seconds,
+            )
+
+            return LLMResponse(
+                findings=findings,
+                raw_text=raw_text,
+            )
 
 
 class DemoMockClient:
