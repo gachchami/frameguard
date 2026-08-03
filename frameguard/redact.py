@@ -7,6 +7,7 @@ from pathlib import Path
 
 import cv2
 
+from .observability import RunEventRecorder
 from .schemas import Finding
 from .video import probe_video
 
@@ -28,13 +29,21 @@ def _expanded_box(
     )
 
 
-def _blur_region(frame, box: tuple[int, int, int, int]) -> None:
+def _strong_redact_region(frame, box: tuple[int, int, int, int]) -> None:
     x1, y1, x2, y2 = box
     region = frame[y1:y2, x1:x2]
     if region.size == 0:
         return
+
+    width = max(1, x2 - x1)
+    height = max(1, y2 - y1)
+    small_width = max(2, width // 18)
+    small_height = max(2, height // 18)
+    pixelated = cv2.resize(region, (small_width, small_height), interpolation=cv2.INTER_AREA)
+    region = cv2.resize(pixelated, (width, height), interpolation=cv2.INTER_NEAREST)
+
     smallest = max(1, min(region.shape[:2]))
-    kernel = min(61, smallest if smallest % 2 else smallest - 1)
+    kernel = min(81, smallest if smallest % 2 else smallest - 1)
     if kernel < 3:
         frame[y1:y2, x1:x2] = 0
         return
@@ -56,11 +65,34 @@ def render_redacted_video(
     input_path: str | Path,
     output_path: str | Path,
     findings: list[Finding],
+    *,
+    recorder: RunEventRecorder | None = None,
 ) -> Path:
     input_path = Path(input_path)
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     info = probe_video(input_path)
+
+    visual_findings = [
+        finding
+        for finding in findings
+        if finding.modality in {"visual", "both"} and finding.observations
+    ]
+    audio_findings = [
+        finding for finding in findings if finding.modality in {"audio", "both"}
+    ]
+
+    if recorder:
+        recorder.info(
+            "render.started",
+            frame_count=info.frame_count,
+            fps=round(info.fps, 3),
+            visual_findings=len(visual_findings),
+            audio_findings=len(audio_findings),
+        )
+
+    redaction_applications = 0
+    written_frames = 0
 
     with tempfile.TemporaryDirectory(prefix="frameguard-render-") as temp_dir:
         temp_video = Path(temp_dir) / "video_only.mp4"
@@ -83,17 +115,13 @@ def render_redacted_video(
                 if not ok:
                     break
                 time_ms = int(frame_index / info.fps * 1000)
-                for finding in findings:
-                    if finding.modality not in {"visual", "both"}:
-                        continue
-                    if not finding.observations:
-                        continue
+                for finding in visual_findings:
                     if not (finding.start_ms <= time_ms <= finding.end_ms):
                         continue
                     observation = finding.nearest_observation(time_ms)
                     if observation is None:
                         continue
-                    _blur_region(
+                    _strong_redact_region(
                         frame,
                         _expanded_box(
                             observation.x,
@@ -104,7 +132,9 @@ def render_redacted_video(
                             info.height,
                         ),
                     )
+                    redaction_applications += 1
                 writer.write(frame)
+                written_frames += 1
                 frame_index += 1
         finally:
             capture.release()
@@ -113,6 +143,12 @@ def render_redacted_video(
         ffmpeg = shutil.which("ffmpeg")
         if not ffmpeg:
             shutil.copy2(temp_video, output_path)
+            if recorder:
+                recorder.warning(
+                    "render.ffmpeg_missing",
+                    audio_redaction_applied=False,
+                    output=output_path.name,
+                )
             return output_path
 
         command = [
@@ -139,7 +175,27 @@ def render_redacted_video(
         if audio_filter:
             command.extend(["-af", audio_filter])
         command.extend(["-c:a", "aac", "-shortest", str(output_path)])
-        result = subprocess.run(command, capture_output=True, text=True)
+
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
         if result.returncode != 0:
-            raise RuntimeError(f"FFmpeg rendering failed: {result.stderr[-1600:]}")
+            if recorder:
+                recorder.error(
+                    "render.ffmpeg_failed",
+                    return_code=result.returncode,
+                    stderr_characters=len(result.stderr),
+                )
+            raise RuntimeError(
+                f"FFmpeg rendering failed with exit code {result.returncode}. "
+                "See the FrameGuard run log."
+            )
+
+    if recorder:
+        recorder.info(
+            "render.completed",
+            output=output_path.name,
+            output_bytes=output_path.stat().st_size if output_path.exists() else 0,
+            written_frames=written_frames,
+            redaction_applications=redaction_applications,
+            audio_intervals=len(audio_findings),
+        )
     return output_path

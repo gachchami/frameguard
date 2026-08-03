@@ -8,7 +8,7 @@ Modality = Literal["visual", "audio", "both"]
 
 @dataclass(slots=True)
 class ModelFinding:
-    """A secret identified semantically by the multimodal model."""
+    """A sensitive item identified semantically by the multimodal model."""
 
     type: str
     value: str
@@ -46,7 +46,7 @@ class BoxObservation:
 
 @dataclass(slots=True)
 class Finding:
-    """A global, redaction-ready finding spanning the original video timeline."""
+    """A global, redaction-ready finding on the original video timeline."""
 
     id: str
     type: str
@@ -59,6 +59,7 @@ class Finding:
     visual_location: str | None = None
     observations: list[BoxObservation] = field(default_factory=list)
     action: str = "blur_or_mute"
+    sources: list[str] = field(default_factory=list)
 
     def nearest_observation(self, time_ms: int) -> BoxObservation | None:
         if not self.observations:

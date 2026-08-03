@@ -1,38 +1,47 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 
 import gradio as gr
 
+from frameguard.observability import configure_application_logging
 from frameguard.pipeline import analyze_video, findings_table
 
-OUTPUT_DIR = Path("outputs")
-OUTPUT_DIR.mkdir(exist_ok=True)
+configure_application_logging()
+LOGGER = logging.getLogger("frameguard.app")
+
+OUTPUT_DIR = Path(os.environ.get("FRAMEGUARD_OUTPUT_DIR", "outputs"))
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_API_BASE = os.environ.get("FRAMEGUARD_API_BASE", "http://127.0.0.1:8091/v1")
-DEFAULT_MODEL = os.environ.get("FRAMEGUARD_MODEL", "Qwen/Qwen2.5-Omni-3B")
+DEFAULT_MODEL = os.environ.get(
+    "FRAMEGUARD_MODEL",
+    "/workspace/persistent/Qwen2.5-Omni-3B",
+)
 DEFAULT_API_KEY = os.environ.get("FRAMEGUARD_API_KEY", "EMPTY")
 DEFAULT_CHUNK_SECONDS = float(os.environ.get("FRAMEGUARD_CHUNK_SECONDS", "5"))
-DEFAULT_DETECTOR = os.environ.get("FRAMEGUARD_DETECTOR", "mock")
-
-MODE_LABELS = {
-    "Laptop smoke test — no LLM": "mock",
-    "Qwen2.5-Omni model server": "qwen",
-}
+DEFAULT_DETECTOR_MODE = os.environ.get("FRAMEGUARD_DETECTOR", "qwen")
 
 
 def run_pipeline(
     video_path: str | None,
-    detector_label: str,
     api_base: str,
     model: str,
     chunk_seconds: float,
+    deterministic_ocr: bool,
+    detect_qr_codes: bool,
+    deterministic_sample_interval_ms: int,
+    run_log_level: str,
+    show_sensitive_values: bool,
+    include_raw_model_output: bool,
 ):
     if not video_path:
         raise gr.Error("Upload an MP4 video first.")
-    detector_mode = MODE_LABELS[detector_label]
+
+    LOGGER.info("FrameGuard run requested")
     try:
         result = analyze_video(
             video_path,
@@ -41,24 +50,40 @@ def run_pipeline(
             api_key=DEFAULT_API_KEY,
             chunk_seconds=float(chunk_seconds),
             output_dir=OUTPUT_DIR,
-            detector_mode=detector_mode,
+            detector_mode=DEFAULT_DETECTOR_MODE,
+            deterministic_ocr=bool(deterministic_ocr),
+            detect_qr_codes=bool(detect_qr_codes),
+            deterministic_sample_interval_ms=int(deterministic_sample_interval_ms),
+            run_log_level=str(run_log_level),
+            include_sensitive_values_in_report=bool(show_sensitive_values),
+            include_raw_model_output=bool(include_raw_model_output),
         )
     except Exception as exc:
+        LOGGER.exception("FrameGuard run failed")
         raise gr.Error(str(exc)) from exc
+
+    report_payload = json.loads(result.report_path.read_text(encoding="utf-8"))
+    report_preview = {
+        "run_id": report_payload.get("run_id"),
+        "privacy": report_payload.get("privacy"),
+        "configuration": report_payload.get("configuration"),
+        "metrics": report_payload.get("metrics"),
+        "findings": report_payload.get("findings"),
+        "model_responses": report_payload.get("model_responses"),
+        "instrumentation": report_payload.get("instrumentation"),
+    }
 
     return (
         str(result.output_video),
-        findings_table(result.findings),
+        str(result.output_video),
+        findings_table(
+            result.findings,
+            show_sensitive_values=bool(show_sensitive_values),
+        ),
         json.dumps(result.metrics, indent=2),
+        json.dumps(report_preview, indent=2),
         str(result.report_path),
-    )
-
-
-def _default_label() -> str:
-    return (
-        "Qwen2.5-Omni model server"
-        if DEFAULT_DETECTOR == "qwen"
-        else "Laptop smoke test — no LLM"
+        str(result.log_path),
     )
 
 
@@ -66,36 +91,71 @@ with gr.Blocks(title="FrameGuard") as frameguard_app:
     gr.Markdown(
         """
 # FrameGuard
-Upload a short screen recording. In production mode, a local Qwen2.5-Omni
-server examines both the visible video and its embedded audio, identifies
-sensitive information, and exports a redacted MP4.
 
-**Laptop smoke-test mode is deterministic and does not run an LLM.** It exists
-only to test the sample video, OCR localization, visual blur, audio mute, report,
-and UI before moving to the AMD Linux machine.
+Analyze a recording locally with Qwen2.5-Omni, deterministic OCR validation,
+and QR detection. Review the redacted preview, audit report, and privacy-safe
+per-run instrumentation before downloading the result.
+
+**Logging policy:** INFO and DEBUG logs never contain detected values, raw Qwen
+responses, prompts, credentials, or media data. DEBUG adds safe detail such as
+request IDs, byte counts, response lengths, stage timings, and localization counts.
 """
     )
-    detector = gr.Radio(
-        choices=list(MODE_LABELS),
-        value=_default_label(),
-        label="Detector",
-    )
+
     with gr.Row():
         input_video = gr.Video(label="Original video", sources=["upload"], format="mp4")
-        output_video = gr.Video(label="Redacted video")
+        output_video = gr.Video(label="Redacted preview")
 
-    with gr.Accordion("Model server", open=False):
-        api_base = gr.Textbox(label="vLLM-Omni API base", value=DEFAULT_API_BASE)
+    with gr.Row():
+        deterministic_ocr = gr.Checkbox(
+            value=True,
+            label="Deterministic OCR safety scan",
+            info=(
+                "Validates emails, IP addresses, known API-key formats, account IDs, "
+                "phone numbers, and private URLs."
+            ),
+        )
+        detect_qr_codes = gr.Checkbox(value=True, label="Redact QR codes")
+
+    with gr.Accordion("Advanced settings", open=False):
+        api_base = gr.Textbox(label="vLLM API base", value=DEFAULT_API_BASE)
         model = gr.Textbox(label="Model", value=DEFAULT_MODEL)
         chunk_seconds = gr.Slider(
             minimum=3,
             maximum=10,
             step=1,
             value=DEFAULT_CHUNK_SECONDS,
-            label="Chunk length in seconds",
+            label="Qwen chunk length in seconds",
+        )
+        deterministic_sample_interval_ms = gr.Slider(
+            minimum=200,
+            maximum=1200,
+            step=50,
+            value=350,
+            label="OCR/QR sampling interval in milliseconds",
+        )
+        run_log_level = gr.Dropdown(
+            choices=["INFO", "DEBUG"],
+            value="INFO",
+            label="Run log detail",
+            info="DEBUG remains privacy-safe; it records more timings and counts.",
+        )
+        show_sensitive_values = gr.Checkbox(
+            value=False,
+            label="Show exact detected values in UI and JSON report",
+            info="Off by default. The report otherwise stores masked previews and fingerprints.",
+        )
+        include_raw_model_output = gr.Checkbox(
+            value=False,
+            label="Include raw Qwen output in JSON report",
+            info=(
+                "Sensitive: raw model output can contain every detected secret. "
+                "It is never written to the run log."
+            ),
         )
 
-    analyze_button = gr.Button("Analyze video and audio, then redact", variant="primary")
+    analyze_button = gr.Button("Analyze and preview redaction", variant="primary")
+
     findings = gr.Dataframe(
         headers=[
             "Type",
@@ -104,24 +164,64 @@ and UI before moving to the AMD Linux machine.
             "Confidence",
             "Start (s)",
             "End (s)",
-            "OCR boxes",
+            "Boxes",
+            "Sources",
+            "Action",
             "Reason",
         ],
+        datatype=[
+            "str",
+            "str",
+            "str",
+            "number",
+            "number",
+            "number",
+            "number",
+            "str",
+            "str",
+            "str",
+        ],
         interactive=False,
-        label="Multimodal findings",
+        label="Detected privacy findings",
     )
-    metrics = gr.Code(label="Metrics", language="json")
-    report = gr.File(label="JSON audit report")
+
+    with gr.Row():
+        metrics = gr.Code(label="Processing metrics", language="json")
+        report_preview = gr.Code(label="Audit report preview", language="json")
+
+    with gr.Row():
+        redacted_download = gr.File(label="Download redacted MP4")
+        report_download = gr.File(label="Download JSON audit report")
+        log_download = gr.File(label="Download privacy-safe run log")
 
     analyze_button.click(
         fn=run_pipeline,
-        inputs=[input_video, detector, api_base, model, chunk_seconds],
-        outputs=[output_video, findings, metrics, report],
+        inputs=[
+            input_video,
+            api_base,
+            model,
+            chunk_seconds,
+            deterministic_ocr,
+            detect_qr_codes,
+            deterministic_sample_interval_ms,
+            run_log_level,
+            show_sensitive_values,
+            include_raw_model_output,
+        ],
+        outputs=[
+            output_video,
+            redacted_download,
+            findings,
+            metrics,
+            report_preview,
+            report_download,
+            log_download,
+        ],
     )
 
 
 if __name__ == "__main__":
     frameguard_app.launch(
-        server_name="0.0.0.0",
+        server_name=os.environ.get("FRAMEGUARD_HOST", "127.0.0.1"),
         server_port=int(os.environ.get("FRAMEGUARD_PORT", "7860")),
     )

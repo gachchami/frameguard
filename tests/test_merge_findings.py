@@ -2,20 +2,30 @@ from frameguard.pipeline import merge_findings
 from frameguard.schemas import Finding
 
 
-def _finding(start: int, end: int) -> Finding:
-    return Finding(
-        id=f"f-{start}",
+def test_merges_qwen_and_ocr_and_preserves_both_sources() -> None:
+    qwen = Finding(
+        id="qwen",
+        type="email",
+        value="alice@example.com",
+        modality="both",
+        start_ms=5000,
+        end_ms=10000,
+        confidence=0.9,
+        sources=["qwen"],
+    )
+    ocr = Finding(
+        id="ocr",
         type="email",
         value="alice@example.com",
         modality="visual",
-        start_ms=start,
-        end_ms=end,
-        confidence=0.8,
+        start_ms=5100,
+        end_ms=9900,
+        confidence=0.99,
+        sources=["ocr_regex"],
     )
 
-
-def test_merges_same_secret_across_chunk_boundary() -> None:
-    merged = merge_findings([_finding(3800, 5000), _finding(5000, 6500)])
+    merged = merge_findings([qwen, ocr])
     assert len(merged) == 1
-    assert merged[0].start_ms == 3800
-    assert merged[0].end_ms == 6500
+    assert merged[0].modality == "both"
+    assert merged[0].action == "blur_and_mute"
+    assert merged[0].sources == ["ocr_regex", "qwen"]

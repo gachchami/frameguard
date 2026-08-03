@@ -1,0 +1,266 @@
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+import logging
+import os
+import secrets
+import threading
+from contextlib import AbstractContextManager
+from datetime import datetime, timezone
+from pathlib import Path
+from time import perf_counter
+from typing import Any
+
+_LEVELS = {
+    "DEBUG": logging.DEBUG,
+    "INFO": logging.INFO,
+    "WARNING": logging.WARNING,
+    "ERROR": logging.ERROR,
+    "CRITICAL": logging.CRITICAL,
+}
+
+_SENSITIVE_KEYS = {
+    "api_key",
+    "authorization",
+    "audio_url",
+    "messages",
+    "password",
+    "payload",
+    "prompt",
+    "raw_response",
+    "raw_text",
+    "secret",
+    "token",
+    "video_url",
+}
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def parse_log_level(value: str | None, *, default: str = "INFO") -> int:
+    normalized = (value or default).strip().upper()
+    return _LEVELS.get(normalized, _LEVELS[default])
+
+
+def configure_application_logging() -> None:
+    """Configure safe console logging once for the Gradio process.
+
+    FrameGuard never writes model prompts, media data URIs, raw model responses,
+    credentials, or detected values to the normal Python log stream.
+    """
+
+    level = parse_log_level(os.environ.get("FRAMEGUARD_LOG_LEVEL"))
+    root = logging.getLogger()
+    if root.handlers:
+        root.setLevel(level)
+        return
+
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+
+
+def mask_value(value: str, kind: str = "") -> str:
+    """Return a UI/report preview that is useful but not the full secret."""
+
+    value = value.strip()
+    if not value:
+        return "<empty>"
+
+    lowered_kind = kind.lower()
+
+    if lowered_kind == "email" and "@" in value:
+        local, domain = value.split("@", 1)
+        local_preview = (local[:1] or "*") + "***"
+        if "." in domain:
+            host, suffix = domain.rsplit(".", 1)
+            domain_preview = (host[:1] or "*") + "***." + suffix
+        else:
+            domain_preview = (domain[:1] or "*") + "***"
+        return f"{local_preview}@{domain_preview}"
+
+    if lowered_kind == "ip_address":
+        parts = value.split(".")
+        if len(parts) == 4:
+            return f"{parts[0]}.***.***.{parts[-1]}"
+
+    if len(value) <= 4:
+        return "*" * len(value)
+
+    if lowered_kind in {"api_key", "password", "private_key", "token"}:
+        return f"{value[:3]}…{value[-4:]}"
+
+    if lowered_kind in {"phone", "phone_number"}:
+        return f"{value[:2]}…{value[-2:]}"
+
+    return f"{value[:2]}…{value[-2:]}"
+
+
+class RunEventRecorder:
+    """Write one privacy-safe JSONL event stream per FrameGuard run.
+
+    INFO records stage boundaries and summaries. DEBUG adds safe diagnostics such
+    as media byte counts, response lengths, and per-finding localization counts.
+    Detected values and raw model text are never written to this log.
+    """
+
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        run_id: str,
+        level: str = "INFO",
+    ) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.run_id = run_id
+        self.level = parse_log_level(level)
+        self._key = secrets.token_bytes(32)
+        self._lock = threading.Lock()
+        self._event_count = 0
+        self._logger = logging.getLogger("frameguard.run")
+
+    @property
+    def event_count(self) -> int:
+        return self._event_count
+
+    def fingerprint(self, value: str) -> str:
+        digest = hmac.new(self._key, value.encode("utf-8"), hashlib.sha256).hexdigest()
+        return digest[:12]
+
+    def value_ref(self, value: str, *, kind: str = "") -> dict[str, object]:
+        return {
+            "kind": kind or "unknown",
+            "length": len(value),
+            "fingerprint": self.fingerprint(value),
+        }
+
+    def debug(self, event: str, **fields: Any) -> None:
+        self.emit("DEBUG", event, **fields)
+
+    def info(self, event: str, **fields: Any) -> None:
+        self.emit("INFO", event, **fields)
+
+    def warning(self, event: str, **fields: Any) -> None:
+        self.emit("WARNING", event, **fields)
+
+    def error(self, event: str, **fields: Any) -> None:
+        self.emit("ERROR", event, **fields)
+
+    def emit(self, level: str, event: str, **fields: Any) -> None:
+        level_number = parse_log_level(level)
+        if level_number < self.level:
+            return
+
+        record: dict[str, Any] = {
+            "timestamp": utc_now_iso(),
+            "level": level.upper(),
+            "event": event,
+            "run_id": self.run_id,
+        }
+        record.update(self._sanitize_mapping(fields))
+
+        encoded = json.dumps(record, sort_keys=True, ensure_ascii=False)
+        with self._lock:
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(encoded + "\n")
+            self._event_count += 1
+
+        self._logger.log(level_number, "%s run_id=%s", event, self.run_id)
+
+    def stage(self, name: str, **fields: Any) -> StageTimer:
+        return StageTimer(self, name, fields)
+
+    def _sanitize_mapping(self, mapping: dict[str, Any]) -> dict[str, Any]:
+        return {str(key): self._sanitize_value(str(key), value) for key, value in mapping.items()}
+
+    def _sanitize_value(self, key: str, value: Any) -> Any:
+        lowered = key.lower()
+
+        if lowered == "value":
+            text = "" if value is None else str(value)
+            return self.value_ref(text)
+
+        if lowered in _SENSITIVE_KEYS:
+            if isinstance(value, str):
+                return {"redacted": True, "characters": len(value)}
+            if isinstance(value, (bytes, bytearray)):
+                return {"redacted": True, "bytes": len(value)}
+            return {"redacted": True}
+
+        if isinstance(value, Path):
+            return value.name
+
+        if isinstance(value, dict):
+            return {
+                str(child_key): self._sanitize_value(str(child_key), child_value)
+                for child_key, child_value in value.items()
+            }
+
+        if isinstance(value, (list, tuple, set)):
+            return [self._sanitize_value("item", item) for item in value]
+
+        if isinstance(value, BaseException):
+            return {
+                "type": type(value).__name__,
+                "message": self._safe_text(str(value)),
+            }
+
+        if isinstance(value, str):
+            return self._safe_text(value)
+
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+
+        return self._safe_text(str(value))
+
+    @staticmethod
+    def _safe_text(value: str, *, limit: int = 500) -> str:
+        # Keep instrumentation bounded. Callers must not pass secrets in ordinary
+        # string fields; sensitive fields are separately blocked above.
+        if len(value) <= limit:
+            return value
+        return value[:limit] + f"…<{len(value) - limit} chars omitted>"
+
+
+class StageTimer(AbstractContextManager["StageTimer"]):
+    def __init__(
+        self,
+        recorder: RunEventRecorder,
+        name: str,
+        fields: dict[str, Any],
+    ) -> None:
+        self.recorder = recorder
+        self.name = name
+        self.fields = fields
+        self.started = 0.0
+        self.elapsed_seconds = 0.0
+
+    def __enter__(self) -> StageTimer:
+        self.started = perf_counter()
+        self.recorder.info(f"{self.name}.started", **self.fields)
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> bool:
+        del traceback
+        self.elapsed_seconds = perf_counter() - self.started
+        if exc is None:
+            self.recorder.info(
+                f"{self.name}.completed",
+                elapsed_seconds=round(self.elapsed_seconds, 4),
+                **self.fields,
+            )
+        else:
+            self.recorder.error(
+                f"{self.name}.failed",
+                elapsed_seconds=round(self.elapsed_seconds, 4),
+                exception_type=exc_type.__name__ if exc_type else "Exception",
+                error=exc,
+                **self.fields,
+            )
+        return False
