@@ -39,6 +39,8 @@ dataset/
 data/
 downloads/
 download/
+outputs/
+output/
 *.model
 *.weights
 
