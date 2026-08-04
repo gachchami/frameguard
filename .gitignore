@@ -77,3 +77,6 @@ uploads/
 *.isa
 *.hsaco
 *.bin
+
+# sha
+SHA256SUMS
