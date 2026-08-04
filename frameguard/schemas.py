@@ -66,5 +66,46 @@ class Finding:
             return None
         return min(self.observations, key=lambda item: abs(item.time_ms - time_ms))
 
+    def observation_at(self, time_ms: int) -> BoxObservation | None:
+        """Return an interpolated box for smooth video redaction.
+
+        Detectors run on sampled frames. Linear interpolation fills the frames
+        between observations so a face blur does not jump or flicker. Outside
+        the observed range, the nearest observation is used while the finding's
+        own start/end interval still controls whether redaction is active.
+        """
+
+        if not self.observations:
+            return None
+        ordered = sorted(self.observations, key=lambda item: item.time_ms)
+        if len(ordered) == 1 or time_ms <= ordered[0].time_ms:
+            return ordered[0]
+        if time_ms >= ordered[-1].time_ms:
+            return ordered[-1]
+
+        previous = ordered[0]
+        for following in ordered[1:]:
+            if time_ms > following.time_ms:
+                previous = following
+                continue
+            span = max(1, following.time_ms - previous.time_ms)
+            ratio = (time_ms - previous.time_ms) / span
+
+            def interpolate(first: int, second: int) -> int:
+                return int(round(first + (second - first) * ratio))
+
+            return BoxObservation(
+                time_ms=time_ms,
+                x=interpolate(previous.x, following.x),
+                y=interpolate(previous.y, following.y),
+                width=max(1, interpolate(previous.width, following.width)),
+                height=max(1, interpolate(previous.height, following.height)),
+                confidence=(
+                    previous.confidence
+                    + (following.confidence - previous.confidence) * ratio
+                ),
+            )
+        return ordered[-1]
+
     def to_dict(self) -> dict[str, object]:
         return asdict(self)

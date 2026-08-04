@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .deterministic_detectors import DeterministicScanResult, scan_deterministic_findings
+from .face_tracking import DEFAULT_FACE_MODEL, FaceScanResult, scan_face_tracks
 from .multimodal_llm import DemoMockClient, QwenOmniClient
 from .observability import RunEventRecorder, mask_value
 from .redact import render_redacted_video
@@ -205,6 +206,12 @@ def analyze_video(
     deterministic_ocr: bool = True,
     detect_qr_codes: bool = True,
     deterministic_sample_interval_ms: int = 350,
+    redact_faces: bool = True,
+    face_model_path: str | Path = DEFAULT_FACE_MODEL,
+    face_sample_interval_ms: int = 200,
+    face_score_threshold: float = 0.75,
+    face_max_track_gap_ms: int = 900,
+    face_min_track_observations: int = 2,
     run_log_level: str = "INFO",
     include_sensitive_values_in_report: bool = False,
     include_raw_model_output: bool = False,
@@ -228,6 +235,12 @@ def analyze_video(
         deterministic_ocr=deterministic_ocr,
         detect_qr_codes=detect_qr_codes,
         deterministic_sample_interval_ms=deterministic_sample_interval_ms,
+        redact_faces=redact_faces,
+        face_model=Path(face_model_path).name,
+        face_sample_interval_ms=face_sample_interval_ms,
+        face_score_threshold=face_score_threshold,
+        face_max_track_gap_ms=face_max_track_gap_ms,
+        face_min_track_observations=face_min_track_observations,
         include_sensitive_values_in_report=include_sensitive_values_in_report,
         include_raw_model_output=include_raw_model_output,
     )
@@ -327,6 +340,24 @@ def analyze_video(
                 ],
             )
 
+        face_scan: FaceScanResult | None = None
+        if redact_faces:
+            face_scan = scan_face_tracks(
+                input_path,
+                model_path=face_model_path,
+                sample_interval_ms=max(50, int(face_sample_interval_ms)),
+                score_threshold=float(face_score_threshold),
+                max_track_gap_ms=max(100, int(face_max_track_gap_ms)),
+                min_track_observations=max(1, int(face_min_track_observations)),
+                recorder=recorder,
+            )
+            global_findings.extend(face_scan.findings)
+            recorder.info(
+                "face_findings.collected",
+                finding_count=len(face_scan.findings),
+                findings=[_finding_ref(item, recorder) for item in face_scan.findings],
+            )
+
         premerge_count = len(global_findings)
         findings = merge_findings(global_findings)
         recorder.info(
@@ -420,6 +451,12 @@ def analyze_video(
             "deterministic_frames_sampled": deterministic_scan.sampled_frames,
             "deterministic_pattern_observations": deterministic_scan.pattern_observations,
             "qr_observations": deterministic_scan.qr_observations,
+            "face_detection_enabled": redact_faces,
+            "face_frames_sampled": face_scan.sampled_frames if face_scan else 0,
+            "face_detections": face_scan.detections if face_scan else 0,
+            "face_tracks": face_scan.tracks if face_scan else 0,
+            "face_rejected_tracks": face_scan.rejected_tracks if face_scan else 0,
+            "face_scan_seconds": round(face_scan.elapsed_seconds, 2) if face_scan else 0.0,
             "chunking_seconds": round(chunking_seconds, 2),
             "model_seconds": round(model_seconds, 2),
             "deterministic_scan_seconds": round(deterministic_scan.elapsed_seconds, 2),
@@ -433,7 +470,7 @@ def analyze_video(
         }
 
         report = {
-            "schema_version": "1.0",
+            "schema_version": "1.1",
             "run_id": run_id,
             "input_video": input_path.name,
             "output_video": output_video.name,
@@ -454,6 +491,12 @@ def analyze_video(
                 "deterministic_ocr": deterministic_ocr,
                 "detect_qr_codes": detect_qr_codes,
                 "deterministic_sample_interval_ms": deterministic_sample_interval_ms,
+                "redact_faces": redact_faces,
+                "face_model": Path(face_model_path).name,
+                "face_sample_interval_ms": face_sample_interval_ms,
+                "face_score_threshold": face_score_threshold,
+                "face_max_track_gap_ms": face_max_track_gap_ms,
+                "face_min_track_observations": face_min_track_observations,
                 "run_log_level": run_log_level.upper(),
             },
             "metrics": metrics,

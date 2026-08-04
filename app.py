@@ -24,6 +24,10 @@ DEFAULT_MODEL = os.environ.get(
 DEFAULT_API_KEY = os.environ.get("FRAMEGUARD_API_KEY", "EMPTY")
 DEFAULT_CHUNK_SECONDS = float(os.environ.get("FRAMEGUARD_CHUNK_SECONDS", "5"))
 DEFAULT_DETECTOR_MODE = os.environ.get("FRAMEGUARD_DETECTOR", "qwen")
+DEFAULT_FACE_MODEL = os.environ.get(
+    "FRAMEGUARD_FACE_MODEL",
+    "models/face_detection_yunet_2023mar.onnx",
+)
 
 
 def run_pipeline(
@@ -34,6 +38,12 @@ def run_pipeline(
     deterministic_ocr: bool,
     detect_qr_codes: bool,
     deterministic_sample_interval_ms: int,
+    redact_faces: bool,
+    face_model_path: str,
+    face_sample_interval_ms: int,
+    face_score_threshold: float,
+    face_max_track_gap_ms: int,
+    face_min_track_observations: int,
     run_log_level: str,
     show_sensitive_values: bool,
     include_raw_model_output: bool,
@@ -54,6 +64,12 @@ def run_pipeline(
             deterministic_ocr=bool(deterministic_ocr),
             detect_qr_codes=bool(detect_qr_codes),
             deterministic_sample_interval_ms=int(deterministic_sample_interval_ms),
+            redact_faces=bool(redact_faces),
+            face_model_path=face_model_path,
+            face_sample_interval_ms=int(face_sample_interval_ms),
+            face_score_threshold=float(face_score_threshold),
+            face_max_track_gap_ms=int(face_max_track_gap_ms),
+            face_min_track_observations=int(face_min_track_observations),
             run_log_level=str(run_log_level),
             include_sensitive_values_in_report=bool(show_sensitive_values),
             include_raw_model_output=bool(include_raw_model_output),
@@ -116,6 +132,14 @@ request IDs, byte counts, response lengths, stage timings, and localization coun
             ),
         )
         detect_qr_codes = gr.Checkbox(value=True, label="Redact QR codes")
+        redact_faces = gr.Checkbox(
+            value=True,
+            label="Redact faces with YuNet",
+            info=(
+                "Runs a neural face detector on sampled frames, associates boxes into "
+                "temporary tracks, and interpolates blur positions between samples."
+            ),
+        )
 
     with gr.Accordion("Advanced settings", open=False):
         api_base = gr.Textbox(label="vLLM API base", value=DEFAULT_API_BASE)
@@ -133,6 +157,40 @@ request IDs, byte counts, response lengths, stage timings, and localization coun
             step=50,
             value=350,
             label="OCR/QR sampling interval in milliseconds",
+        )
+        face_model_path = gr.Textbox(
+            label="YuNet model path",
+            value=DEFAULT_FACE_MODEL,
+        )
+        face_sample_interval_ms = gr.Slider(
+            minimum=100,
+            maximum=1000,
+            step=50,
+            value=200,
+            label="Face detection sampling interval in milliseconds",
+            info="Lower values improve coverage but run more neural inference.",
+        )
+        face_score_threshold = gr.Slider(
+            minimum=0.5,
+            maximum=0.95,
+            step=0.01,
+            value=0.75,
+            label="Face confidence threshold",
+            info="Lower values favor privacy recall; higher values reduce false positives.",
+        )
+        face_max_track_gap_ms = gr.Slider(
+            minimum=300,
+            maximum=2000,
+            step=100,
+            value=900,
+            label="Maximum face-track gap in milliseconds",
+        )
+        face_min_track_observations = gr.Slider(
+            minimum=1,
+            maximum=5,
+            step=1,
+            value=2,
+            label="Minimum observations per face track",
         )
         run_log_level = gr.Dropdown(
             choices=["INFO", "DEBUG"],
@@ -204,6 +262,12 @@ request IDs, byte counts, response lengths, stage timings, and localization coun
             deterministic_ocr,
             detect_qr_codes,
             deterministic_sample_interval_ms,
+            redact_faces,
+            face_model_path,
+            face_sample_interval_ms,
+            face_score_threshold,
+            face_max_track_gap_ms,
+            face_min_track_observations,
             run_log_level,
             show_sensitive_values,
             include_raw_model_output,

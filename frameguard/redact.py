@@ -118,9 +118,12 @@ def render_redacted_video(
                 for finding in visual_findings:
                     if not (finding.start_ms <= time_ms <= finding.end_ms):
                         continue
-                    observation = finding.nearest_observation(time_ms)
+                    observation = finding.observation_at(time_ms)
                     if observation is None:
                         continue
+                    padding = 10
+                    if finding.type == "face":
+                        padding = max(12, int(max(observation.width, observation.height) * 0.18))
                     _strong_redact_region(
                         frame,
                         _expanded_box(
@@ -130,6 +133,7 @@ def render_redacted_video(
                             observation.height,
                             info.width,
                             info.height,
+                            padding=padding,
                         ),
                     )
                     redaction_applications += 1
