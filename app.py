@@ -7,6 +7,7 @@ from pathlib import Path
 
 import gradio as gr
 
+from frameguard.face_reference import DEFAULT_COSINE_THRESHOLD
 from frameguard.observability import configure_application_logging
 from frameguard.pipeline import analyze_video, findings_table
 
@@ -28,6 +29,10 @@ DEFAULT_FACE_MODEL = os.environ.get(
     "FRAMEGUARD_FACE_MODEL",
     "models/face_detection_yunet_2023mar.onnx",
 )
+DEFAULT_FACE_RECOGNITION_MODEL = os.environ.get(
+    "FRAMEGUARD_FACE_RECOGNITION_MODEL",
+    "models/face_recognition_sface_2021dec.onnx",
+)
 
 
 def run_pipeline(
@@ -44,12 +49,22 @@ def run_pipeline(
     face_score_threshold: float,
     face_max_track_gap_ms: int,
     face_min_track_observations: int,
+    face_redaction_mode: str,
+    reference_face_path: str | None,
+    face_recognition_model_path: str,
+    reference_match_threshold: float,
     run_log_level: str,
     show_sensitive_values: bool,
     include_raw_model_output: bool,
 ):
     if not video_path:
         raise gr.Error("Upload an MP4 video first.")
+
+    normalized_face_mode = str(face_redaction_mode).strip().lower()
+    if redact_faces and normalized_face_mode == "reference" and not reference_face_path:
+        raise gr.Error(
+            "Upload one clear reference-face image when using reference-only face redaction."
+        )
 
     LOGGER.info("FrameGuard run requested")
     try:
@@ -70,6 +85,10 @@ def run_pipeline(
             face_score_threshold=float(face_score_threshold),
             face_max_track_gap_ms=int(face_max_track_gap_ms),
             face_min_track_observations=int(face_min_track_observations),
+            face_redaction_mode=normalized_face_mode,
+            reference_face_path=reference_face_path,
+            face_recognition_model_path=face_recognition_model_path,
+            reference_match_threshold=float(reference_match_threshold),
             run_log_level=str(run_log_level),
             include_sensitive_values_in_report=bool(show_sensitive_values),
             include_raw_model_output=bool(include_raw_model_output),
@@ -109,12 +128,14 @@ with gr.Blocks(title="FrameGuard") as frameguard_app:
 # FrameGuard
 
 Analyze a recording locally with Qwen2.5-Omni, deterministic OCR validation,
-and QR detection. Review the redacted preview, audit report, and privacy-safe
-per-run instrumentation before downloading the result.
+and QR detection. Face redaction can blur every detected face or only the face
+matching an uploaded reference photo. Review the redacted preview, audit report,
+and privacy-safe per-run instrumentation before downloading the result.
 
 **Logging policy:** INFO and DEBUG logs never contain detected values, raw Qwen
-responses, prompts, credentials, or media data. DEBUG adds safe detail such as
-request IDs, byte counts, response lengths, stage timings, and localization counts.
+responses, prompts, credentials, media data, reference photos, or face embeddings.
+DEBUG adds safe detail such as request IDs, byte counts, response lengths, stage
+timings, and localization counts.
 """
     )
 
@@ -141,6 +162,27 @@ request IDs, byte counts, response lengths, stage timings, and localization coun
             ),
         )
 
+    with gr.Row():
+        face_redaction_mode = gr.Radio(
+            choices=[
+                ("Blur every detected face", "all"),
+                ("Blur only the uploaded reference face", "reference"),
+            ],
+            value="all",
+            label="Face redaction mode",
+        )
+        reference_face = gr.Image(
+            label="Reference face image (reference-only mode)",
+            type="filepath",
+            sources=["upload"],
+            height=220,
+        )
+
+    gr.Markdown(
+        "The reference image and derived SFace embedding are used only in memory "
+        "for the current run and are not written to FrameGuard logs or reports."
+    )
+
     with gr.Accordion("Advanced settings", open=False):
         api_base = gr.Textbox(label="vLLM API base", value=DEFAULT_API_BASE)
         model = gr.Textbox(label="Model", value=DEFAULT_MODEL)
@@ -161,6 +203,21 @@ request IDs, byte counts, response lengths, stage timings, and localization coun
         face_model_path = gr.Textbox(
             label="YuNet model path",
             value=DEFAULT_FACE_MODEL,
+        )
+        face_recognition_model_path = gr.Textbox(
+            label="SFace recognition model path",
+            value=DEFAULT_FACE_RECOGNITION_MODEL,
+        )
+        reference_match_threshold = gr.Slider(
+            minimum=0.20,
+            maximum=0.80,
+            step=0.01,
+            value=DEFAULT_COSINE_THRESHOLD,
+            label="Reference-face cosine match threshold",
+            info=(
+                "Higher values are stricter. OpenCV's published SFace cosine "
+                "threshold is 0.363; tune using your validation videos."
+            ),
         )
         face_sample_interval_ms = gr.Slider(
             minimum=100,
@@ -268,6 +325,10 @@ request IDs, byte counts, response lengths, stage timings, and localization coun
             face_score_threshold,
             face_max_track_gap_ms,
             face_min_track_observations,
+            face_redaction_mode,
+            reference_face,
+            face_recognition_model_path,
+            reference_match_threshold,
             run_log_level,
             show_sensitive_values,
             include_raw_model_output,

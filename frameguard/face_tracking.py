@@ -28,6 +28,17 @@ class FaceDetection:
     width: int
     height: int
     confidence: float
+    landmarks: tuple[float, ...] = ()
+
+    def to_yunet_row(self) -> np.ndarray:
+        if len(self.landmarks) != 10:
+            raise ValueError(
+                "YuNet landmarks are required for SFace reference matching"
+            )
+        return np.asarray(
+            [self.x, self.y, self.width, self.height, *self.landmarks],
+            dtype=np.float32,
+        )
 
     def to_observation(self, time_ms: int) -> BoxObservation:
         return BoxObservation(
@@ -49,10 +60,22 @@ class FaceScanResult:
     rejected_tracks: int
     elapsed_seconds: float
     model_path: Path
+    redaction_mode: str = "all"
+    reference_candidates: int = 0
+    reference_matches: int = 0
+    reference_rejections: int = 0
 
 
 class FaceDetector(Protocol):
     def detect(self, frame: np.ndarray) -> list[FaceDetection]: ...
+
+
+class FaceMatcher(Protocol):
+    def matches(
+        self,
+        frame: np.ndarray,
+        detection: FaceDetection,
+    ) -> tuple[bool, float]: ...
 
 
 class YuNetFaceDetector:
@@ -104,6 +127,7 @@ class YuNetFaceDetector:
         detections: list[FaceDetection] = []
         for row in raw_faces:
             x, y, box_width, box_height = (float(value) for value in row[:4])
+            landmarks = tuple(float(value) for value in row[4:14])
             confidence = float(row[-1])
 
             x1 = max(0, min(width - 1, int(round(x))))
@@ -118,6 +142,7 @@ class YuNetFaceDetector:
                     width=x2 - x1,
                     height=y2 - y1,
                     confidence=max(0.0, min(1.0, confidence)),
+                    landmarks=landmarks,
                 )
             )
         return detections
@@ -283,22 +308,37 @@ def _track_to_finding(
     *,
     duration_ms: int,
     sample_interval_ms: int,
+    redaction_mode: str,
 ) -> Finding:
     observations = sorted(track.observations, key=lambda item: item.time_ms)
     confidence = sum(item.confidence for item in observations) / len(observations)
+    reference_only = redaction_mode == "reference"
     return Finding(
         id=f"finding_{uuid.uuid4().hex[:8]}",
         type="face",
-        value=f"face_{track.track_number:03d}",
+        value=(
+            f"reference_face_{track.track_number:03d}"
+            if reference_only
+            else f"face_{track.track_number:03d}"
+        ),
         modality="visual",
         start_ms=max(0, observations[0].time_ms - sample_interval_ms),
         end_ms=min(duration_ms, observations[-1].time_ms + sample_interval_ms),
         confidence=confidence,
-        reason="Detected by YuNet neural face detector and associated across sampled frames",
+        reason=(
+            "Matched the uploaded reference face with SFace, then associated "
+            "the matched boxes across sampled frames"
+            if reference_only
+            else "Detected by YuNet neural face detector and associated across sampled frames"
+        ),
         visual_location="tracked face bounding box",
         observations=observations,
         action="blur",
-        sources=["yunet"],
+        sources=(
+            ["yunet", "sface_reference"]
+            if reference_only
+            else ["yunet"]
+        ),
     )
 
 
@@ -311,14 +351,28 @@ def scan_face_tracks(
     max_track_gap_ms: int = 900,
     min_track_observations: int = 2,
     keep_single_detection_threshold: float = 0.93,
+    redaction_mode: str = "all",
+    reference_face_path: str | Path | None = None,
+    recognition_model_path: str | Path | None = None,
+    reference_match_threshold: float = 0.363,
     recorder: RunEventRecorder | None = None,
     detector: FaceDetector | None = None,
+    matcher: FaceMatcher | None = None,
 ) -> FaceScanResult:
-    """Detect faces on sampled frames and associate them into temporal tracks."""
+    """Detect and track all faces or only a user-supplied reference face.
+
+    ``redaction_mode='all'`` tracks every detected face. ``'reference'`` first
+    filters YuNet detections through SFace cosine matching and tracks only the
+    detections that match the uploaded reference image.
+    """
 
     started = time.perf_counter()
     video_path = Path(video_path)
     model_path = Path(model_path)
+    normalized_mode = redaction_mode.strip().lower()
+    if normalized_mode not in {"all", "reference"}:
+        raise ValueError("face redaction mode must be 'all' or 'reference'")
+
     info = probe_video(video_path)
     interval_ms = max(50, int(sample_interval_ms))
     frame_step = max(1, round(info.fps * interval_ms / 1000.0))
@@ -332,12 +386,33 @@ def scan_face_tracks(
             score_threshold=score_threshold,
             max_track_gap_ms=max_track_gap_ms,
             min_track_observations=min_track_observations,
+            redaction_mode=normalized_mode,
+            reference_face_supplied=bool(reference_face_path),
+            reference_match_threshold=(
+                reference_match_threshold if normalized_mode == "reference" else None
+            ),
         )
 
     effective_detector = detector or YuNetFaceDetector(
         model_path,
         score_threshold=score_threshold,
     )
+
+    effective_matcher = matcher
+    if normalized_mode == "reference" and effective_matcher is None:
+        if reference_face_path is None:
+            raise ValueError(
+                "Upload a reference face image when face redaction mode is 'reference'."
+            )
+        from .face_reference import DEFAULT_SFACE_MODEL, ReferenceFaceMatcher
+
+        effective_matcher = ReferenceFaceMatcher(
+            reference_image_path=reference_face_path,
+            detector=effective_detector,  # type: ignore[arg-type]
+            model_path=recognition_model_path or DEFAULT_SFACE_MODEL,
+            cosine_threshold=reference_match_threshold,
+        )
+
     tracker = FaceTracker(
         frame_width=info.width,
         frame_height=info.height,
@@ -350,6 +425,9 @@ def scan_face_tracks(
 
     sampled_frames = 0
     detection_count = 0
+    reference_candidates = 0
+    reference_matches = 0
+    reference_rejections = 0
     frame_index = 0
     try:
         while True:
@@ -364,9 +442,24 @@ def scan_face_tracks(
                 info.duration_ms,
                 int(round(frame_index / info.fps * 1000.0)),
             )
-            detections = effective_detector.detect(frame)
+            all_detections = effective_detector.detect(frame)
+            detection_count += len(all_detections)
+            detections = all_detections
+
+            if normalized_mode == "reference":
+                assert effective_matcher is not None
+                matched: list[FaceDetection] = []
+                reference_candidates += len(all_detections)
+                for detection in all_detections:
+                    is_match, _similarity = effective_matcher.matches(frame, detection)
+                    if is_match:
+                        matched.append(detection)
+                        reference_matches += 1
+                    else:
+                        reference_rejections += 1
+                detections = matched
+
             sampled_frames += 1
-            detection_count += len(detections)
             tracker.update(time_ms, detections)
 
             if recorder:
@@ -374,7 +467,8 @@ def scan_face_tracks(
                     "face_scan.frame",
                     frame_index=frame_index,
                     time_ms=time_ms,
-                    detections=len(detections),
+                    detections=len(all_detections),
+                    detections_after_reference_filter=len(detections),
                     active_tracks=sum(
                         time_ms - track.last_observation.time_ms <= max_track_gap_ms
                         for track in tracker.tracks
@@ -402,6 +496,7 @@ def scan_face_tracks(
             track,
             duration_ms=info.duration_ms,
             sample_interval_ms=interval_ms,
+            redaction_mode=normalized_mode,
         )
         for track in accepted_tracks
     ]
@@ -415,6 +510,10 @@ def scan_face_tracks(
             detections=detection_count,
             tracks=len(findings),
             rejected_tracks=rejected_tracks,
+            redaction_mode=normalized_mode,
+            reference_candidates=reference_candidates,
+            reference_matches=reference_matches,
+            reference_rejections=reference_rejections,
             track_observation_counts=[len(item.observations) for item in findings],
         )
 
@@ -426,4 +525,8 @@ def scan_face_tracks(
         rejected_tracks=rejected_tracks,
         elapsed_seconds=elapsed,
         model_path=model_path,
+        redaction_mode=normalized_mode,
+        reference_candidates=reference_candidates,
+        reference_matches=reference_matches,
+        reference_rejections=reference_rejections,
     )

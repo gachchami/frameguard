@@ -118,3 +118,44 @@ def test_scan_face_tracks_accepts_injected_detector(tmp_path: Path) -> None:
     assert result.findings[0].type == "face"
     assert result.findings[0].value == "face_001"
     assert len(result.findings[0].observations) == 5
+
+
+class _TwoFaceDetector:
+    def detect(self, frame: np.ndarray) -> list[FaceDetection]:
+        del frame
+        return [
+            FaceDetection(20, 30, 40, 50, 0.98),
+            FaceDetection(100, 30, 40, 50, 0.97),
+        ]
+
+
+class _LeftFaceMatcher:
+    def matches(
+        self,
+        frame: np.ndarray,
+        detection: FaceDetection,
+    ) -> tuple[bool, float]:
+        del frame
+        return detection.x < 50, 0.8 if detection.x < 50 else 0.1
+
+
+def test_reference_mode_tracks_only_matching_face(tmp_path: Path) -> None:
+    video_path = tmp_path / "video.mp4"
+    _write_test_video(video_path)
+
+    result = scan_face_tracks(
+        video_path,
+        detector=_TwoFaceDetector(),
+        matcher=_LeftFaceMatcher(),
+        redaction_mode="reference",
+        sample_interval_ms=200,
+        min_track_observations=2,
+    )
+
+    assert result.detections == 10
+    assert result.reference_candidates == 10
+    assert result.reference_matches == 5
+    assert result.reference_rejections == 5
+    assert result.tracks == 1
+    assert result.findings[0].value == "reference_face_001"
+    assert result.findings[0].sources == ["yunet", "sface_reference"]

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .deterministic_detectors import DeterministicScanResult, scan_deterministic_findings
+from .face_reference import DEFAULT_COSINE_THRESHOLD, DEFAULT_SFACE_MODEL
 from .face_tracking import DEFAULT_FACE_MODEL, FaceScanResult, scan_face_tracks
 from .multimodal_llm import DemoMockClient, QwenOmniClient
 from .observability import RunEventRecorder, mask_value
@@ -212,6 +213,10 @@ def analyze_video(
     face_score_threshold: float = 0.75,
     face_max_track_gap_ms: int = 900,
     face_min_track_observations: int = 2,
+    face_redaction_mode: str = "all",
+    reference_face_path: str | Path | None = None,
+    face_recognition_model_path: str | Path = DEFAULT_SFACE_MODEL,
+    reference_match_threshold: float = DEFAULT_COSINE_THRESHOLD,
     run_log_level: str = "INFO",
     include_sensitive_values_in_report: bool = False,
     include_raw_model_output: bool = False,
@@ -241,6 +246,10 @@ def analyze_video(
         face_score_threshold=face_score_threshold,
         face_max_track_gap_ms=face_max_track_gap_ms,
         face_min_track_observations=face_min_track_observations,
+        face_redaction_mode=face_redaction_mode,
+        reference_face_supplied=bool(reference_face_path),
+        face_recognition_model=Path(face_recognition_model_path).name,
+        reference_match_threshold=reference_match_threshold,
         include_sensitive_values_in_report=include_sensitive_values_in_report,
         include_raw_model_output=include_raw_model_output,
     )
@@ -349,6 +358,10 @@ def analyze_video(
                 score_threshold=float(face_score_threshold),
                 max_track_gap_ms=max(100, int(face_max_track_gap_ms)),
                 min_track_observations=max(1, int(face_min_track_observations)),
+                redaction_mode=face_redaction_mode,
+                reference_face_path=reference_face_path,
+                recognition_model_path=face_recognition_model_path,
+                reference_match_threshold=float(reference_match_threshold),
                 recorder=recorder,
             )
             global_findings.extend(face_scan.findings)
@@ -456,6 +469,10 @@ def analyze_video(
             "face_detections": face_scan.detections if face_scan else 0,
             "face_tracks": face_scan.tracks if face_scan else 0,
             "face_rejected_tracks": face_scan.rejected_tracks if face_scan else 0,
+            "face_redaction_mode": face_scan.redaction_mode if face_scan else face_redaction_mode,
+            "reference_face_candidates": face_scan.reference_candidates if face_scan else 0,
+            "reference_face_matches": face_scan.reference_matches if face_scan else 0,
+            "reference_face_rejections": face_scan.reference_rejections if face_scan else 0,
             "face_scan_seconds": round(face_scan.elapsed_seconds, 2) if face_scan else 0.0,
             "chunking_seconds": round(chunking_seconds, 2),
             "model_seconds": round(model_seconds, 2),
@@ -470,7 +487,7 @@ def analyze_video(
         }
 
         report = {
-            "schema_version": "1.1",
+            "schema_version": "1.2",
             "run_id": run_id,
             "input_video": input_path.name,
             "output_video": output_video.name,
@@ -478,6 +495,11 @@ def analyze_video(
                 "contains_sensitive_values": include_sensitive_values_in_report,
                 "contains_raw_model_output": include_raw_model_output,
                 "log_contains_sensitive_values": False,
+                "reference_face_or_embedding_persisted": False,
+                "reference_face_policy": (
+                    "The uploaded reference image and SFace embedding are used in memory "
+                    "for the current run and are not written to the audit report or run log."
+                ),
                 "log_policy": (
                     "INFO and DEBUG logs contain counts, timings, types, lengths, and "
                     "per-run fingerprints only. They never contain detected values, prompts, "
@@ -497,6 +519,10 @@ def analyze_video(
                 "face_score_threshold": face_score_threshold,
                 "face_max_track_gap_ms": face_max_track_gap_ms,
                 "face_min_track_observations": face_min_track_observations,
+                "face_redaction_mode": face_redaction_mode,
+                "reference_face_supplied": bool(reference_face_path),
+                "face_recognition_model": Path(face_recognition_model_path).name,
+                "reference_match_threshold": reference_match_threshold,
                 "run_log_level": run_log_level.upper(),
             },
             "metrics": metrics,

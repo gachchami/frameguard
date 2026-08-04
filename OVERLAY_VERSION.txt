@@ -1,0 +1,4 @@
+FrameGuard reference-face overlay
+Version: 2.0.0
+Built: 2026-08-04
+Required new capability: upload one reference face and blur only matching face tracks using YuNet + SFace.
