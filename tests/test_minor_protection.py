@@ -24,7 +24,7 @@ def test_clear_minor_interval_is_blurred() -> None:
     assert decision.blur is True
 
 
-def test_boundary_overlap_is_uncertain_and_blurred() -> None:
+def test_boundary_overlap_is_uncertain_and_visible_by_default() -> None:
     decision = decide_age_policy(
         track_id="face_002",
         estimated_age_low=17,
@@ -32,6 +32,20 @@ def test_boundary_overlap_is_uncertain_and_blurred() -> None:
         confidence=0.88,
         quality="good",
         sample_count=5,
+    )
+    assert decision.category == "uncertain"
+    assert decision.blur is False
+
+
+def test_boundary_overlap_can_be_blurred_in_strict_mode() -> None:
+    decision = decide_age_policy(
+        track_id="face_002b",
+        estimated_age_low=17,
+        estimated_age_high=21,
+        confidence=0.88,
+        quality="good",
+        sample_count=5,
+        blur_uncertain=True,
     )
     assert decision.category == "uncertain"
     assert decision.blur is True
@@ -50,7 +64,7 @@ def test_high_confidence_adult_interval_can_remain_visible() -> None:
     assert decision.blur is False
 
 
-def test_low_confidence_adult_estimate_fails_closed() -> None:
+def test_low_confidence_adult_estimate_is_uncertain_and_visible_by_default() -> None:
     decision = decide_age_policy(
         track_id="face_004",
         estimated_age_low=30,
@@ -60,10 +74,10 @@ def test_low_confidence_adult_estimate_fails_closed() -> None:
         sample_count=3,
     )
     assert decision.category == "uncertain"
-    assert decision.blur is True
+    assert decision.blur is False
 
 
-def test_estimator_failure_is_uncertain_and_blurred() -> None:
+def test_estimator_failure_is_uncertain_and_visible_by_default() -> None:
     decision = decide_age_policy(
         track_id="face_005",
         estimated_age_low=None,
@@ -74,7 +88,7 @@ def test_estimator_failure_is_uncertain_and_blurred() -> None:
         failure_reason="no_usable_face_crops",
     )
     assert decision.category == "uncertain"
-    assert decision.blur is True
+    assert decision.blur is False
 
 
 class _FakeEstimator:

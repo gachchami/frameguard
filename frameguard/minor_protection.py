@@ -141,12 +141,13 @@ def decide_age_policy(
     minimum_confidence: float = 0.65,
     elapsed_seconds: float = 0.0,
     failure_reason: str | None = None,
+    blur_uncertain: bool = False,
 ) -> AgeDecision:
     """Convert an uncertain age interval into a privacy-safe blur decision.
 
-    Only a high-confidence interval whose lower edge is at least
-    ``confident_adult_age`` is allowed to remain visible. Everything else is
-    blurred. This is intentionally conservative around the 18-year boundary.
+    A clear likely-minor interval is always blurred. A clear adult interval is
+    left visible. Uncertain estimates are blurred only when ``blur_uncertain``
+    is enabled; the default implements the literal “likely minors only” mode.
     """
 
     quality_normalized = str(quality or "poor").strip().lower()
@@ -161,7 +162,7 @@ def decide_age_policy(
             confidence=0.0,
             quality="poor",
             category="uncertain",
-            blur=True,
+            blur=bool(blur_uncertain),
             reason=failure_reason,
             sample_count=sample_count,
             elapsed_seconds=elapsed_seconds,
@@ -175,7 +176,7 @@ def decide_age_policy(
             confidence=confidence,
             quality=quality_normalized,
             category="uncertain",
-            blur=True,
+            blur=bool(blur_uncertain),
             reason="missing_age_interval",
             sample_count=sample_count,
             elapsed_seconds=elapsed_seconds,
@@ -186,7 +187,7 @@ def decide_age_policy(
 
     if quality_normalized == "poor" or confidence < minimum_confidence:
         category: AgeCategory = "uncertain"
-        blur = True
+        blur = bool(blur_uncertain)
         reason = "low_quality_or_confidence"
     elif high < minor_boundary:
         category = "likely_minor"
@@ -198,7 +199,7 @@ def decide_age_policy(
         reason = "high_confidence_interval_above_adult_safety_margin"
     else:
         category = "uncertain"
-        blur = True
+        blur = bool(blur_uncertain)
         reason = "interval_overlaps_minor_or_safety_margin"
 
     return AgeDecision(
@@ -234,6 +235,7 @@ class QwenAgeEstimator:
         confident_adult_age: int = 22,
         minimum_confidence: float = 0.65,
         fail_closed: bool = True,
+        blur_uncertain: bool = False,
         recorder: RunEventRecorder | None = None,
     ) -> None:
         self.api_base = api_base.rstrip("/")
@@ -244,6 +246,7 @@ class QwenAgeEstimator:
         self.confident_adult_age = int(confident_adult_age)
         self.minimum_confidence = float(minimum_confidence)
         self.fail_closed = bool(fail_closed)
+        self.blur_uncertain = bool(blur_uncertain)
         self.recorder = recorder
 
     @staticmethod
@@ -277,6 +280,7 @@ class QwenAgeEstimator:
                 minimum_confidence=self.minimum_confidence,
                 elapsed_seconds=time.perf_counter() - started,
                 failure_reason="no_usable_face_crops",
+                blur_uncertain=self.blur_uncertain,
             )
 
         content: list[dict[str, object]] = [self._image_part(crop) for crop in usable]
@@ -330,6 +334,7 @@ class QwenAgeEstimator:
                 confident_adult_age=self.confident_adult_age,
                 minimum_confidence=self.minimum_confidence,
                 elapsed_seconds=time.perf_counter() - started,
+                blur_uncertain=self.blur_uncertain,
             )
         except Exception as exc:
             if not self.fail_closed:
@@ -346,6 +351,7 @@ class QwenAgeEstimator:
                 minimum_confidence=self.minimum_confidence,
                 elapsed_seconds=time.perf_counter() - started,
                 failure_reason=f"estimator_failure:{type(exc).__name__}",
+                blur_uncertain=self.blur_uncertain,
             )
 
         if self.recorder:

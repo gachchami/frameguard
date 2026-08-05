@@ -59,6 +59,7 @@ def run_pipeline(
     age_minimum_confidence: float,
     age_max_samples_per_track: int,
     age_fail_closed: bool,
+    age_blur_uncertain: bool,
     run_log_level: str,
     show_sensitive_values: bool,
     include_raw_model_output: bool,
@@ -103,6 +104,7 @@ def run_pipeline(
                 age_minimum_confidence=float(age_minimum_confidence),
                 age_max_samples_per_track=int(age_max_samples_per_track),
                 age_fail_closed=bool(age_fail_closed),
+                age_blur_uncertain=bool(age_blur_uncertain),
                 **common_kwargs,
             )
         else:
@@ -152,12 +154,12 @@ with gr.Blocks(title="FrameGuard", analytics_enabled=False) as frameguard_app:
 
 Analyze a recording locally with Qwen2.5-Omni, deterministic OCR validation,
 and QR detection. Face protection can blur every detected face, only a face
-matching an uploaded reference photo, or tracks conservatively classified as
-likely minors or age-uncertain.
+matching an uploaded reference photo, or tracks classified as likely minors.
 
-**Likely-minors mode is probabilistic:** it does not establish legal age. Only a
-high-confidence adult interval above the configured safety margin remains visible;
-minor, boundary-overlap, low-quality, and model-failure tracks are blurred.
+**Likely-minors mode is probabilistic:** it does not establish legal age. Clear
+likely-minor tracks are blurred. Uncertain tracks remain visible by default so
+this mode does not blur everyone; enable the stricter uncertainty option when
+privacy recall matters more than adult false positives.
 
 **Logging policy:** INFO and DEBUG logs never contain detected secret values, raw
 Qwen responses, prompts, credentials, media data, reference photos, face crops,
@@ -193,7 +195,7 @@ or face embeddings.
             choices=[
                 ("Blur every detected face", "all"),
                 ("Blur only the uploaded reference face", "reference"),
-                ("Blur likely minors and uncertain ages", "likely_minors"),
+                ("Blur likely minors only", "likely_minors"),
             ],
             value="all",
             label="Face redaction mode",
@@ -314,10 +316,21 @@ or face embeddings.
                 value=5,
                 label="Age samples per face track",
             )
+        age_blur_uncertain = gr.Checkbox(
+            value=False,
+            label="Also blur uncertain ages",
+            info=(
+                "Off means only clearly likely-minor tracks are blurred. Turning this "
+                "on is privacy-conservative but can blur many adults."
+            ),
+        )
         age_fail_closed = gr.Checkbox(
             value=True,
-            label="Blur when age estimation fails",
-            info="Recommended. A model error or unusable crop is treated as uncertain.",
+            label="Continue when age estimation fails",
+            info=(
+                "On converts estimator errors into an uncertain result. Whether that "
+                "result is blurred is controlled by the option above."
+            ),
         )
 
         run_log_level = gr.Dropdown(
@@ -405,6 +418,7 @@ or face embeddings.
             age_minimum_confidence,
             age_max_samples_per_track,
             age_fail_closed,
+            age_blur_uncertain,
             run_log_level,
             show_sensitive_values,
             include_raw_model_output,

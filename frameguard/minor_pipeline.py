@@ -112,6 +112,7 @@ def analyze_video_with_face_policy(
     age_minimum_confidence: float = 0.65,
     age_max_samples_per_track: int = 5,
     age_fail_closed: bool = True,
+    age_blur_uncertain: bool = False,
     **pipeline_kwargs: Any,
 ) -> PipelineResult:
     """Run FrameGuard with off/all/likely-minors face-redaction policies.
@@ -156,6 +157,7 @@ def analyze_video_with_face_policy(
         minimum_confidence=float(age_minimum_confidence),
         max_samples_per_track=int(age_max_samples_per_track),
         fail_closed=bool(age_fail_closed),
+        blur_uncertain=bool(age_blur_uncertain),
     )
 
     face_scan = scan_face_tracks(
@@ -176,6 +178,7 @@ def analyze_video_with_face_policy(
         confident_adult_age=int(age_confident_adult_age),
         minimum_confidence=float(age_minimum_confidence),
         fail_closed=bool(age_fail_closed),
+        blur_uncertain=bool(age_blur_uncertain),
         recorder=recorder,
     )
     selected_face_findings, decisions = classify_minor_face_tracks(
@@ -222,6 +225,7 @@ def analyze_video_with_face_policy(
         "age_minimum_confidence": float(age_minimum_confidence),
         "age_max_samples_per_track": int(age_max_samples_per_track),
         "age_fail_closed": bool(age_fail_closed),
+        "age_blur_uncertain": bool(age_blur_uncertain),
     }
     _update_report(
         result.report_path,
