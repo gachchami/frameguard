@@ -1,101 +1,157 @@
 from __future__ import annotations
 
+import json
+
 import numpy as np
 
 from frameguard.minor_protection import (
     AgeDecision,
+    TimestampAssessment,
+    TrackEvidence,
     _message_content_text,
+    _parse_timestamp_assessments,
     classify_minor_face_tracks,
-    decide_age_policy,
+    decide_child_policy,
 )
 from frameguard.schemas import BoxObservation, Finding
 
 
-def test_clear_minor_interval_is_blurred() -> None:
-    decision = decide_age_policy(
+def assessment(
+    index: int,
+    classification: str,
+    *,
+    confidence: float = 0.9,
+    quality: str = "good",
+) -> TimestampAssessment:
+    return TimestampAssessment(
+        index=index,
+        classification=classification,  # type: ignore[arg-type]
+        confidence=confidence,
+        quality=quality,
+    )
+
+
+def test_three_consistent_child_timestamps_are_blurred() -> None:
+    decision = decide_child_policy(
         track_id="face_001",
-        estimated_age_low=11,
-        estimated_age_high=16,
-        confidence=0.91,
-        quality="good",
-        sample_count=5,
+        assessments=[
+            assessment(1, "child"),
+            assessment(2, "child"),
+            assessment(3, "child"),
+            assessment(4, "uncertain", confidence=0.8),
+        ],
+        sample_count=4,
+        minimum_usable_timestamps=3,
+        consensus_fraction=0.70,
     )
     assert decision.category == "likely_minor"
     assert decision.blur is True
+    assert decision.child_votes == 3
 
 
-def test_boundary_overlap_is_uncertain_and_visible_by_default() -> None:
-    decision = decide_age_policy(
+def test_three_consistent_adult_timestamps_remain_visible() -> None:
+    decision = decide_child_policy(
         track_id="face_002",
-        estimated_age_low=17,
-        estimated_age_high=21,
-        confidence=0.88,
-        quality="good",
-        sample_count=5,
+        assessments=[
+            assessment(1, "adult"),
+            assessment(2, "adult"),
+            assessment(3, "adult"),
+            assessment(4, "uncertain", confidence=0.8),
+        ],
+        sample_count=4,
+        minimum_usable_timestamps=3,
+        consensus_fraction=0.70,
+    )
+    assert decision.category == "likely_adult"
+    assert decision.blur is False
+    assert decision.adult_votes == 3
+
+
+def test_child_and_adult_votes_are_uncertain() -> None:
+    decision = decide_child_policy(
+        track_id="face_003",
+        assessments=[
+            assessment(1, "child"),
+            assessment(2, "child"),
+            assessment(3, "adult"),
+            assessment(4, "uncertain"),
+        ],
+        sample_count=4,
+        minimum_usable_timestamps=3,
+        consensus_fraction=0.60,
     )
     assert decision.category == "uncertain"
     assert decision.blur is False
+    assert decision.reason == "conflicting_child_adult_votes"
 
 
-def test_boundary_overlap_can_be_blurred_in_strict_mode() -> None:
-    decision = decide_age_policy(
-        track_id="face_002b",
-        estimated_age_low=17,
-        estimated_age_high=21,
-        confidence=0.88,
-        quality="good",
-        sample_count=5,
+def test_too_few_usable_timestamps_are_uncertain() -> None:
+    decision = decide_child_policy(
+        track_id="face_004",
+        assessments=[
+            assessment(1, "child", quality="poor"),
+            assessment(2, "child", confidence=0.40),
+            assessment(3, "adult", confidence=0.95),
+        ],
+        sample_count=3,
+        minimum_confidence=0.70,
+        minimum_usable_timestamps=3,
+    )
+    assert decision.category == "uncertain"
+    assert decision.usable_timestamps == 1
+    assert decision.blur is False
+
+
+def test_uncertain_can_be_blurred_in_strict_mode() -> None:
+    decision = decide_child_policy(
+        track_id="face_005",
+        assessments=[assessment(1, "uncertain")],
+        sample_count=1,
+        minimum_usable_timestamps=3,
         blur_uncertain=True,
     )
     assert decision.category == "uncertain"
     assert decision.blur is True
 
 
-def test_high_confidence_adult_interval_can_remain_visible() -> None:
-    decision = decide_age_policy(
-        track_id="face_003",
-        estimated_age_low=24,
-        estimated_age_high=31,
-        confidence=0.86,
-        quality="good",
-        sample_count=5,
+def test_parser_accepts_timestamp_array() -> None:
+    parsed, reasons = _parse_timestamp_assessments(
+        {
+            "timestamps": [
+                {
+                    "index": 1,
+                    "classification": "kid",
+                    "confidence": 0.91,
+                    "quality": "good",
+                    "reason_codes": ["childlike_face"],
+                },
+                {
+                    "index": 2,
+                    "classification": "grown-up",
+                    "confidence": 0.88,
+                    "quality": "mixed",
+                },
+            ],
+            "overall_reason_codes": ["mixed_views"],
+        },
+        expected_count=2,
     )
-    assert decision.category == "likely_adult"
-    assert decision.blur is False
-
-
-def test_low_confidence_adult_estimate_is_uncertain_and_visible_by_default() -> None:
-    decision = decide_age_policy(
-        track_id="face_004",
-        estimated_age_low=30,
-        estimated_age_high=38,
-        confidence=0.40,
-        quality="limited",
-        sample_count=3,
-    )
-    assert decision.category == "uncertain"
-    assert decision.blur is False
-
-
-def test_estimator_failure_is_uncertain_and_visible_by_default() -> None:
-    decision = decide_age_policy(
-        track_id="face_005",
-        estimated_age_low=None,
-        estimated_age_high=None,
-        confidence=0.0,
-        quality="poor",
-        sample_count=0,
-        failure_reason="no_usable_face_crops",
-    )
-    assert decision.category == "uncertain"
-    assert decision.blur is False
+    assert [item.classification for item in parsed] == ["child", "adult"]
+    assert parsed[1].quality == "limited"
+    assert reasons == ("mixed_views",)
 
 
 class _FakeEstimator:
     def __init__(self, decision: AgeDecision) -> None:
         self.decision = decision
 
-    def estimate(self, crops: list[np.ndarray], *, track_id: str) -> AgeDecision:
+    def estimate(
+        self,
+        evidence: list[TrackEvidence],
+        *,
+        track_id: str,
+    ) -> AgeDecision:
+        assert evidence
         assert track_id == self.decision.track_id
         return self.decision
 
@@ -122,17 +178,30 @@ def test_classifier_excludes_confident_adult_track(monkeypatch) -> None:
         action="blur",
         sources=["yunet"],
     )
-    decision = decide_age_policy(
+    decision = decide_child_policy(
         track_id="face_001",
-        estimated_age_low=25,
-        estimated_age_high=32,
-        confidence=0.9,
-        quality="good",
-        sample_count=1,
+        assessments=[
+            assessment(1, "adult"),
+            assessment(2, "adult"),
+            assessment(3, "adult"),
+        ],
+        sample_count=3,
+    )
+    evidence = TrackEvidence(
+        time_ms=0,
+        full_frame=np.zeros((200, 300, 3), dtype=np.uint8),
+        person_crop=np.zeros((180, 100, 3), dtype=np.uint8),
+        face_crop=np.zeros((100, 100, 3), dtype=np.uint8),
+        face_width_px=100,
+        face_height_px=100,
+        detector_confidence=0.95,
+        face_sharpness=100.0,
+        quality_score=0.95,
+        quality_hint="good",
     )
     monkeypatch.setattr(
-        "frameguard.minor_protection.extract_track_crops",
-        lambda *args, **kwargs: [np.zeros((128, 128, 3), dtype=np.uint8)],
+        "frameguard.minor_protection.extract_track_evidence",
+        lambda *args, **kwargs: [evidence],
     )
     selected, decisions = classify_minor_face_tracks(
         "unused.mp4",
@@ -145,5 +214,85 @@ def test_classifier_excludes_confident_adult_track(monkeypatch) -> None:
 
 def test_message_content_accepts_typed_text_blocks() -> None:
     assert _message_content_text(
-        [{"type": "text", "text": '{"estimated_age_low": 12}'}]
-    ) == '{"estimated_age_low": 12}'
+        [{"type": "text", "text": '{"timestamps": []}'}]
+    ) == '{"timestamps": []}'
+
+
+def test_qwen_classifier_uses_three_views_and_aggregates_adult_votes(monkeypatch) -> None:
+    from frameguard.minor_protection import QwenChildClassifier
+
+    evidence = [
+        TrackEvidence(
+            time_ms=index * 500,
+            full_frame=np.zeros((180, 320, 3), dtype=np.uint8),
+            person_crop=np.zeros((180, 100, 3), dtype=np.uint8),
+            face_crop=np.zeros((96, 96, 3), dtype=np.uint8),
+            face_width_px=96,
+            face_height_px=96,
+            detector_confidence=0.94,
+            face_sharpness=90.0,
+            quality_score=0.9,
+            quality_hint="good",
+        )
+        for index in range(3)
+    ]
+    captured: dict[str, object] = {}
+
+    class _Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "timestamps": [
+                                        {
+                                            "index": index,
+                                            "classification": "adult",
+                                            "confidence": 0.92,
+                                            "quality": "good",
+                                            "reason_codes": ["mature_face"],
+                                        }
+                                        for index in range(1, 4)
+                                    ]
+                                }
+                            )
+                        }
+                    }
+                ]
+            }
+
+    class _Client:
+        def __init__(self, *, timeout: float) -> None:
+            captured["timeout"] = timeout
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def post(self, url: str, *, headers, json):
+            captured["url"] = url
+            captured["payload"] = json
+            return _Response()
+
+    monkeypatch.setattr("frameguard.minor_protection.httpx.Client", _Client)
+    classifier = QwenChildClassifier(
+        api_base="http://127.0.0.1:8091/v1",
+        model="local-model",
+        minimum_usable_timestamps=3,
+    )
+    decision = classifier.estimate(evidence, track_id="face_009")
+
+    assert decision.category == "likely_adult"
+    assert decision.blur is False
+    payload = captured["payload"]
+    assert isinstance(payload, dict)
+    content = payload["messages"][0]["content"]  # type: ignore[index]
+    image_parts = [item for item in content if item.get("type") == "image_url"]
+    assert len(image_parts) == 9

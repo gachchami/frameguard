@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from .face_tracking import DEFAULT_FACE_MODEL, scan_face_tracks
 from .minor_protection import (
     FaceRedactionMode,
-    QwenAgeEstimator,
+    QwenChildClassifier,
     classify_minor_face_tracks,
 )
 from .observability import RunEventRecorder
@@ -28,13 +28,14 @@ def normalize_face_redaction_mode(value: str | None) -> FaceRedactionMode:
         "likely_minor": "likely_minors",
         "minors": "likely_minors",
         "children": "likely_minors",
+        "visually_apparent_children": "likely_minors",
     }
     normalized = aliases.get(normalized, normalized)
     if normalized not in _VALID_MODES:
         raise ValueError(
             f"Unknown face redaction mode {value!r}; expected off, all, or likely_minors"
         )
-    return normalized  # type: ignore[return-value]
+    return cast(FaceRedactionMode, normalized)
 
 
 def _face_report(finding: Finding) -> dict[str, object]:
@@ -69,7 +70,7 @@ def _update_report(
     *,
     mode: FaceRedactionMode,
     selected_face_findings: list[Finding],
-    age_decisions: list[dict[str, object]],
+    child_decisions: list[dict[str, object]],
     metrics: dict[str, object],
     configuration: dict[str, object],
 ) -> None:
@@ -87,13 +88,17 @@ def _update_report(
     if isinstance(metrics_payload, dict):
         metrics_payload.update(metrics)
 
-    payload["age_estimation"] = {
-        "purpose": "privacy-protective apparent-age triage",
+    uncertain_action = (
+        "blurred" if bool(configuration.get("child_blur_uncertain")) else "left visible"
+    )
+    payload["child_classification"] = {
+        "purpose": "holistic visual child/adult privacy triage",
         "warning": (
-            "Apparent age is probabilistic and is not proof of legal age. "
-            "Uncertain tracks are blurred by default."
+            "Visual classification is probabilistic and does not establish legal age. "
+            "Each decision combines marked full-scene, person-context, and face views "
+            f"from multiple timestamps. Uncertain tracks are {uncertain_action}."
         ),
-        "decisions": age_decisions,
+        "decisions": child_decisions,
     }
 
     findings_payload = payload.setdefault("findings", [])
@@ -107,20 +112,15 @@ def analyze_video_with_face_policy(
     input_path: str | Path,
     *,
     face_redaction_mode: str = "all",
-    age_minor_boundary: int = 18,
-    age_confident_adult_age: int = 22,
-    age_minimum_confidence: float = 0.65,
-    age_max_samples_per_track: int = 5,
-    age_fail_closed: bool = True,
-    age_blur_uncertain: bool = False,
+    child_minimum_confidence: float = 0.70,
+    child_minimum_usable_timestamps: int = 3,
+    child_consensus_fraction: float = 0.70,
+    child_max_samples_per_track: int = 5,
+    child_continue_on_error: bool = True,
+    child_blur_uncertain: bool = False,
     **pipeline_kwargs: Any,
 ) -> PipelineResult:
-    """Run FrameGuard with off/all/likely-minors face-redaction policies.
-
-    The existing pipeline remains the source of truth for semantic-secret, OCR,
-    QR, audio, rendering, reporting, and normal all-face redaction behavior.
-    Only the likely-minors mode adds a post-pipeline face-age triage stage.
-    """
+    """Run FrameGuard with all-face or visually-apparent-child redaction."""
 
     mode = normalize_face_redaction_mode(face_redaction_mode)
     base_kwargs = dict(pipeline_kwargs)
@@ -150,14 +150,14 @@ def analyze_video_with_face_policy(
         level=run_log_level,
     )
     recorder.info(
-        "minor_protection.started",
+        "child_protection.started",
         face_model=face_model_path.name,
-        minor_boundary=int(age_minor_boundary),
-        confident_adult_age=int(age_confident_adult_age),
-        minimum_confidence=float(age_minimum_confidence),
-        max_samples_per_track=int(age_max_samples_per_track),
-        fail_closed=bool(age_fail_closed),
-        blur_uncertain=bool(age_blur_uncertain),
+        minimum_confidence=float(child_minimum_confidence),
+        minimum_usable_timestamps=int(child_minimum_usable_timestamps),
+        consensus_fraction=float(child_consensus_fraction),
+        max_samples_per_track=int(child_max_samples_per_track),
+        continue_on_error=bool(child_continue_on_error),
+        blur_uncertain=bool(child_blur_uncertain),
     )
 
     face_scan = scan_face_tracks(
@@ -170,22 +170,22 @@ def analyze_video_with_face_policy(
         recorder=recorder,
     )
 
-    estimator = QwenAgeEstimator(
+    classifier = QwenChildClassifier(
         api_base=str(base_kwargs["api_base"]),
         model=str(base_kwargs["model"]),
         api_key=str(base_kwargs.get("api_key", "EMPTY")),
-        minor_boundary=int(age_minor_boundary),
-        confident_adult_age=int(age_confident_adult_age),
-        minimum_confidence=float(age_minimum_confidence),
-        fail_closed=bool(age_fail_closed),
-        blur_uncertain=bool(age_blur_uncertain),
+        minimum_confidence=float(child_minimum_confidence),
+        minimum_usable_timestamps=int(child_minimum_usable_timestamps),
+        consensus_fraction=float(child_consensus_fraction),
+        continue_on_error=bool(child_continue_on_error),
+        blur_uncertain=bool(child_blur_uncertain),
         recorder=recorder,
     )
     selected_face_findings, decisions = classify_minor_face_tracks(
         input_path,
         face_scan.findings,
-        estimator=estimator,
-        max_samples_per_track=max(1, int(age_max_samples_per_track)),
+        estimator=classifier,
+        max_samples_per_track=max(1, int(child_max_samples_per_track)),
         recorder=recorder,
     )
 
@@ -201,42 +201,47 @@ def analyze_video_with_face_policy(
     metrics.update(
         {
             "face_redaction_mode": mode,
-            "age_face_tracks": face_scan.tracks,
-            "age_tracks_blurred": len(selected_face_findings),
-            "age_likely_minor_tracks": sum(
+            "child_face_tracks": face_scan.tracks,
+            "child_tracks_blurred": len(selected_face_findings),
+            "child_likely_child_tracks": sum(
                 item.category == "likely_minor" for item in decisions
             ),
-            "age_uncertain_tracks": sum(item.category == "uncertain" for item in decisions),
-            "age_likely_adult_tracks": sum(
+            "child_uncertain_tracks": sum(
+                item.category == "uncertain" for item in decisions
+            ),
+            "child_likely_adult_tracks": sum(
                 item.category == "likely_adult" for item in decisions
             ),
-            "age_face_scan_seconds": round(face_scan.elapsed_seconds, 4),
-            "age_estimation_seconds": round(
+            "child_face_scan_seconds": round(face_scan.elapsed_seconds, 4),
+            "child_classification_seconds": round(
                 sum(item.elapsed_seconds for item in decisions),
                 4,
+            ),
+            "child_total_usable_timestamps": sum(
+                item.usable_timestamps for item in decisions
             ),
             "output_bytes": result.output_video.stat().st_size,
         }
     )
 
     configuration = {
-        "age_minor_boundary": int(age_minor_boundary),
-        "age_confident_adult_age": int(age_confident_adult_age),
-        "age_minimum_confidence": float(age_minimum_confidence),
-        "age_max_samples_per_track": int(age_max_samples_per_track),
-        "age_fail_closed": bool(age_fail_closed),
-        "age_blur_uncertain": bool(age_blur_uncertain),
+        "child_minimum_confidence": float(child_minimum_confidence),
+        "child_minimum_usable_timestamps": int(child_minimum_usable_timestamps),
+        "child_consensus_fraction": float(child_consensus_fraction),
+        "child_max_samples_per_track": int(child_max_samples_per_track),
+        "child_continue_on_error": bool(child_continue_on_error),
+        "child_blur_uncertain": bool(child_blur_uncertain),
     }
     _update_report(
         result.report_path,
         mode=mode,
         selected_face_findings=selected_face_findings,
-        age_decisions=[item.to_dict() for item in decisions],
+        child_decisions=[item.to_dict() for item in decisions],
         metrics=metrics,
         configuration=configuration,
     )
     recorder.info(
-        "minor_protection.rendered",
+        "child_protection.rendered",
         face_tracks=face_scan.tracks,
         blurred_tracks=len(selected_face_findings),
         output=result.output_video.name,

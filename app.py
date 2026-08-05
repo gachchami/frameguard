@@ -54,12 +54,12 @@ def run_pipeline(
     reference_face_path: str | None,
     face_recognition_model_path: str,
     reference_match_threshold: float,
-    age_minor_boundary: int,
-    age_confident_adult_age: int,
-    age_minimum_confidence: float,
-    age_max_samples_per_track: int,
-    age_fail_closed: bool,
-    age_blur_uncertain: bool,
+    child_minimum_confidence: float,
+    child_minimum_usable_timestamps: int,
+    child_consensus_fraction: float,
+    child_max_samples_per_track: int,
+    child_continue_on_error: bool,
+    child_blur_uncertain: bool,
     run_log_level: str,
     show_sensitive_values: bool,
     include_raw_model_output: bool,
@@ -68,6 +68,10 @@ def run_pipeline(
         raise gr.Error("Upload an MP4 video first.")
 
     normalized_face_mode = str(face_redaction_mode).strip().lower()
+    if int(child_minimum_usable_timestamps) > int(child_max_samples_per_track):
+        raise gr.Error(
+            "Minimum usable timestamps cannot exceed maximum timestamps per track."
+        )
     if redact_faces and normalized_face_mode == "reference" and not reference_face_path:
         raise gr.Error(
             "Upload one clear reference-face image when using reference-only face redaction."
@@ -99,12 +103,12 @@ def run_pipeline(
             result = analyze_video_with_face_policy(
                 video_path,
                 face_redaction_mode="likely_minors",
-                age_minor_boundary=int(age_minor_boundary),
-                age_confident_adult_age=int(age_confident_adult_age),
-                age_minimum_confidence=float(age_minimum_confidence),
-                age_max_samples_per_track=int(age_max_samples_per_track),
-                age_fail_closed=bool(age_fail_closed),
-                age_blur_uncertain=bool(age_blur_uncertain),
+                child_minimum_confidence=float(child_minimum_confidence),
+                child_minimum_usable_timestamps=int(child_minimum_usable_timestamps),
+                child_consensus_fraction=float(child_consensus_fraction),
+                child_max_samples_per_track=int(child_max_samples_per_track),
+                child_continue_on_error=bool(child_continue_on_error),
+                child_blur_uncertain=bool(child_blur_uncertain),
                 **common_kwargs,
             )
         else:
@@ -127,7 +131,7 @@ def run_pipeline(
         "privacy": report_payload.get("privacy"),
         "configuration": report_payload.get("configuration"),
         "metrics": report_payload.get("metrics"),
-        "age_estimation": report_payload.get("age_estimation"),
+        "child_classification": report_payload.get("child_classification"),
         "findings": report_payload.get("findings"),
         "model_responses": report_payload.get("model_responses"),
         "instrumentation": report_payload.get("instrumentation"),
@@ -152,18 +156,24 @@ with gr.Blocks(title="FrameGuard", analytics_enabled=False) as frameguard_app:
         """
 # FrameGuard
 
-Analyze a recording locally with Qwen2.5-Omni, deterministic OCR validation,
-and QR detection. Face protection can blur every detected face, only a face
-matching an uploaded reference photo, or tracks classified as likely minors.
+FrameGuard analyzes video and audio for sensitive information, localizes visual
+content, and produces a redacted MP4 with an audit report. Face protection
+supports all-face redaction, reference-face matching, and holistic visual
+child/adult classification.
 
-**Likely-minors mode is probabilistic:** it does not establish legal age. Clear
-likely-minor tracks are blurred. Uncertain tracks remain visible by default so
-this mode does not blur everyone; enable the stricter uncertainty option when
-privacy recall matters more than adult false positives.
+The child-protection mode examines multiple timestamps for each YuNet track. At
+each timestamp, Qwen receives the marked full scene, a person-context crop, and
+a face crop. It classifies the person as visually appearing to be a child, an
+adult, or uncertain. This is a privacy heuristic and does not establish legal
+age.
 
-**Logging policy:** INFO and DEBUG logs never contain detected secret values, raw
-Qwen responses, prompts, credentials, media data, reference photos, face crops,
-or face embeddings.
+By default, only tracks with multi-timestamp child consensus are blurred.
+Uncertain tracks remain visible unless **Also blur uncertain classifications**
+is enabled.
+
+**Logging policy:** run logs exclude detected secret values, raw model output,
+prompts, credentials, media payloads, reference images, face crops, and face
+embeddings.
 """
     )
 
@@ -195,7 +205,7 @@ or face embeddings.
             choices=[
                 ("Blur every detected face", "all"),
                 ("Blur only the uploaded reference face", "reference"),
-                ("Blur likely minors only", "likely_minors"),
+                ("Blur visually apparent children only", "likely_minors"),
             ],
             value="all",
             label="Face redaction mode",
@@ -208,9 +218,9 @@ or face embeddings.
         )
 
     gr.Markdown(
-        "The reference image and derived SFace embedding are used only in memory "
-        "for the current run. Likely-minors mode samples several crops from each "
-        "temporary YuNet track and sends them only to the local Omni endpoint."
+        "Reference images and SFace embeddings are held in memory for one run. "
+        "Child-protection mode sends selected full-scene, person-context, and "
+        "face views to the configured local Omni endpoint."
     )
 
     with gr.Accordion("Advanced settings", open=False):
@@ -246,7 +256,7 @@ or face embeddings.
             label="Reference-face cosine match threshold",
             info=(
                 "Higher values are stricter. OpenCV's published SFace cosine "
-                "threshold is 0.363; tune using your validation videos."
+                "threshold is 0.363; calibrate it on a representative validation set."
             ),
         )
         face_sample_interval_ms = gr.Slider(
@@ -280,56 +290,61 @@ or face embeddings.
             label="Minimum observations per face track",
         )
 
-        gr.Markdown("### Likely-minors policy")
+        gr.Markdown("### Visually apparent child policy")
         with gr.Row():
-            age_minor_boundary = gr.Slider(
-                minimum=13,
-                maximum=21,
-                step=1,
-                value=18,
-                label="Minor boundary",
-                info="An interval entirely below this age is classified likely minor.",
-            )
-            age_confident_adult_age = gr.Slider(
-                minimum=19,
-                maximum=30,
-                step=1,
-                value=22,
-                label="Adult safety margin",
-                info=(
-                    "A face remains visible only when the estimated interval starts "
-                    "at or above this value."
-                ),
-            )
-        with gr.Row():
-            age_minimum_confidence = gr.Slider(
-                minimum=0.5,
+            child_minimum_confidence = gr.Slider(
+                minimum=0.50,
                 maximum=0.95,
                 step=0.01,
-                value=0.65,
-                label="Minimum age-estimation confidence",
+                value=0.70,
+                label="Minimum per-timestamp confidence",
+                info="Lower-confidence timestamp judgments do not count toward consensus.",
             )
-            age_max_samples_per_track = gr.Slider(
-                minimum=1,
+            child_max_samples_per_track = gr.Slider(
+                minimum=3,
                 maximum=8,
                 step=1,
                 value=5,
-                label="Age samples per face track",
+                label="Maximum timestamps per face track",
+                info=(
+                    "The best temporally separated timestamps are selected using face "
+                    "size, detector confidence, and sharpness."
+                ),
             )
-        age_blur_uncertain = gr.Checkbox(
+        with gr.Row():
+            child_minimum_usable_timestamps = gr.Slider(
+                minimum=2,
+                maximum=6,
+                step=1,
+                value=3,
+                label="Minimum usable timestamps",
+                info="At least this many reliable judgments are required before blurring.",
+            )
+            child_consensus_fraction = gr.Slider(
+                minimum=0.50,
+                maximum=1.00,
+                step=0.05,
+                value=0.70,
+                label="Required child/adult consensus",
+                info=(
+                    "A track must reach this fraction without an opposite-class vote. "
+                    "Mixed child/adult votes become uncertain."
+                ),
+            )
+        child_blur_uncertain = gr.Checkbox(
             value=False,
-            label="Also blur uncertain ages",
+            label="Also blur uncertain classifications",
             info=(
-                "Off means only clearly likely-minor tracks are blurred. Turning this "
-                "on is privacy-conservative but can blur many adults."
+                "Off means only tracks with strong child consensus are blurred. Turning "
+                "this on is privacy-conservative but can blur adults."
             ),
         )
-        age_fail_closed = gr.Checkbox(
+        child_continue_on_error = gr.Checkbox(
             value=True,
-            label="Continue when age estimation fails",
+            label="Continue when child classification fails",
             info=(
-                "On converts estimator errors into an uncertain result. Whether that "
-                "result is blurred is controlled by the option above."
+                "Converts classifier errors into an uncertain result instead of stopping "
+                "the complete run. The uncertainty setting controls redaction."
             ),
         )
 
@@ -349,7 +364,7 @@ or face embeddings.
             label="Include raw Qwen output in JSON report",
             info=(
                 "Sensitive: raw secret-detection output can contain every detected secret. "
-                "Age-estimation prompts and raw responses are never included."
+                "Child-classification prompts and raw responses are never included."
             ),
         )
 
@@ -413,12 +428,12 @@ or face embeddings.
             reference_face,
             face_recognition_model_path,
             reference_match_threshold,
-            age_minor_boundary,
-            age_confident_adult_age,
-            age_minimum_confidence,
-            age_max_samples_per_track,
-            age_fail_closed,
-            age_blur_uncertain,
+            child_minimum_confidence,
+            child_minimum_usable_timestamps,
+            child_consensus_fraction,
+            child_max_samples_per_track,
+            child_continue_on_error,
+            child_blur_uncertain,
             run_log_level,
             show_sensitive_values,
             include_raw_model_output,
