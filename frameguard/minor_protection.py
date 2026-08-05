@@ -84,6 +84,24 @@ Return one timestamps entry for every supplied timestamp index.
 _JSON_FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
 _VALID_REASON_CODE = re.compile(r"^[a-z0-9_]{1,64}$")
 
+_CHILD_EVIDENCE_CODES = frozenset({
+    "childlike_face",
+    "childlike_body_proportions",
+})
+_ADULT_EVIDENCE_CODES = frozenset({
+    "mature_face",
+    "adult_body_proportions",
+})
+_DISQUALIFYING_VISUAL_CODES = frozenset({
+    "small_face",
+    "motion_blur",
+    "profile_view",
+    "occlusion",
+    "conflicting_evidence",
+    "insufficient_detail",
+})
+_MIN_FACE_WIDTH_PX_FOR_CHILD_DECISION = 64
+
 
 @dataclass(frozen=True, slots=True)
 class TrackEvidence:
@@ -345,16 +363,40 @@ def decide_child_policy(
             median_face_width_px=median_face_width_px,
         )
 
-    usable = [
+    reliable = [
         item
         for item in assessments
-        if item.quality in {"good", "limited"}
+        if item.quality == "good"
         and item.confidence >= confidence_threshold
     ]
-    child_items = [item for item in usable if item.classification == "child"]
-    adult_items = [item for item in usable if item.classification == "adult"]
-    uncertain_items = [item for item in usable if item.classification == "uncertain"]
 
+    def supported_child_vote(item: TimestampAssessment) -> bool:
+        codes = set(item.reason_codes)
+        return (
+            item.classification == "child"
+            and _CHILD_EVIDENCE_CODES.issubset(codes)
+            and not (codes & _ADULT_EVIDENCE_CODES)
+            and not (codes & _DISQUALIFYING_VISUAL_CODES)
+        )
+
+    def supported_adult_vote(item: TimestampAssessment) -> bool:
+        codes = set(item.reason_codes)
+        return (
+            item.classification == "adult"
+            and bool(codes & _ADULT_EVIDENCE_CODES)
+            and not (codes & _CHILD_EVIDENCE_CODES)
+            and not (codes & _DISQUALIFYING_VISUAL_CODES)
+        )
+
+    child_items = [item for item in reliable if supported_child_vote(item)]
+    adult_items = [item for item in reliable if supported_adult_vote(item)]
+    uncertain_items = [
+        item
+        for item in reliable
+        if item not in child_items and item not in adult_items
+    ]
+
+    usable = [*child_items, *adult_items, *uncertain_items]
     usable_count = len(usable)
     child_votes = len(child_items)
     adult_votes = len(adult_items)
@@ -366,8 +408,21 @@ def decide_child_policy(
     for item in assessments:
         all_reason_codes.update(item.reason_codes)
 
-    if usable_count < minimum_usable:
+    if (
+        median_face_width_px is not None
+        and median_face_width_px < _MIN_FACE_WIDTH_PX_FOR_CHILD_DECISION
+    ):
         category: AgeCategory = "uncertain"
+        reason = "face_too_small_for_reliable_child_classification"
+        all_reason_codes.add(reason)
+        confidence = (
+            sum(item.confidence for item in usable) / usable_count
+            if usable_count
+            else 0.0
+        )
+        quality = "poor"
+    elif usable_count < minimum_usable:
+        category = "uncertain"
         reason = "insufficient_usable_timestamps"
         all_reason_codes.add(reason)
         confidence = (

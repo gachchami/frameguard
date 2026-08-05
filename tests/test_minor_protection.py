@@ -22,12 +22,14 @@ def assessment(
     *,
     confidence: float = 0.9,
     quality: str = "good",
+    reason_codes: tuple[str, ...] = (),
 ) -> TimestampAssessment:
     return TimestampAssessment(
         index=index,
         classification=classification,  # type: ignore[arg-type]
         confidence=confidence,
         quality=quality,
+        reason_codes=reason_codes,
     )
 
 
@@ -35,9 +37,9 @@ def test_three_consistent_child_timestamps_are_blurred() -> None:
     decision = decide_child_policy(
         track_id="face_001",
         assessments=[
-            assessment(1, "child"),
-            assessment(2, "child"),
-            assessment(3, "child"),
+            assessment(1, "child", reason_codes=("childlike_face", "childlike_body_proportions")),
+            assessment(2, "child", reason_codes=("childlike_face", "childlike_body_proportions")),
+            assessment(3, "child", reason_codes=("childlike_face", "childlike_body_proportions")),
             assessment(4, "uncertain", confidence=0.8),
         ],
         sample_count=4,
@@ -53,9 +55,9 @@ def test_three_consistent_adult_timestamps_remain_visible() -> None:
     decision = decide_child_policy(
         track_id="face_002",
         assessments=[
-            assessment(1, "adult"),
-            assessment(2, "adult"),
-            assessment(3, "adult"),
+            assessment(1, "adult", reason_codes=("mature_face",)),
+            assessment(2, "adult", reason_codes=("adult_body_proportions",)),
+            assessment(3, "adult", reason_codes=("mature_face", "adult_body_proportions")),
             assessment(4, "uncertain", confidence=0.8),
         ],
         sample_count=4,
@@ -71,9 +73,9 @@ def test_child_and_adult_votes_are_uncertain() -> None:
     decision = decide_child_policy(
         track_id="face_003",
         assessments=[
-            assessment(1, "child"),
-            assessment(2, "child"),
-            assessment(3, "adult"),
+            assessment(1, "child", reason_codes=("childlike_face", "childlike_body_proportions")),
+            assessment(2, "child", reason_codes=("childlike_face", "childlike_body_proportions")),
+            assessment(3, "adult", reason_codes=("mature_face",)),
             assessment(4, "uncertain"),
         ],
         sample_count=4,
@@ -181,9 +183,9 @@ def test_classifier_excludes_confident_adult_track(monkeypatch) -> None:
     decision = decide_child_policy(
         track_id="face_001",
         assessments=[
-            assessment(1, "adult"),
-            assessment(2, "adult"),
-            assessment(3, "adult"),
+            assessment(1, "adult", reason_codes=("mature_face",)),
+            assessment(2, "adult", reason_codes=("adult_body_proportions",)),
+            assessment(3, "adult", reason_codes=("mature_face", "adult_body_proportions")),
         ],
         sample_count=3,
     )
@@ -296,3 +298,51 @@ def test_qwen_classifier_uses_three_views_and_aggregates_adult_votes(monkeypatch
     content = payload["messages"][0]["content"]  # type: ignore[index]
     image_parts = [item for item in content if item.get("type") == "image_url"]
     assert len(image_parts) == 9
+
+
+def test_child_labels_without_holistic_evidence_do_not_blur() -> None:
+    decision = decide_child_policy(
+        track_id="face_weak",
+        assessments=[
+            assessment(1, "child"),
+            assessment(2, "child"),
+            assessment(3, "child"),
+        ],
+        sample_count=3,
+        median_face_width_px=120,
+    )
+    assert decision.category == "uncertain"
+    assert decision.blur is False
+
+
+def test_limited_quality_child_votes_do_not_blur() -> None:
+    reasons = ("childlike_face", "childlike_body_proportions")
+    decision = decide_child_policy(
+        track_id="face_limited",
+        assessments=[
+            assessment(1, "child", quality="limited", reason_codes=reasons),
+            assessment(2, "child", quality="limited", reason_codes=reasons),
+            assessment(3, "child", quality="limited", reason_codes=reasons),
+        ],
+        sample_count=3,
+        median_face_width_px=120,
+    )
+    assert decision.category == "uncertain"
+    assert decision.blur is False
+
+
+def test_small_face_child_consensus_does_not_blur() -> None:
+    reasons = ("childlike_face", "childlike_body_proportions")
+    decision = decide_child_policy(
+        track_id="face_small",
+        assessments=[
+            assessment(1, "child", reason_codes=reasons),
+            assessment(2, "child", reason_codes=reasons),
+            assessment(3, "child", reason_codes=reasons),
+        ],
+        sample_count=3,
+        median_face_width_px=42,
+    )
+    assert decision.category == "uncertain"
+    assert decision.reason == "face_too_small_for_reliable_child_classification"
+    assert decision.blur is False
