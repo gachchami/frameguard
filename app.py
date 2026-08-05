@@ -8,6 +8,7 @@ from pathlib import Path
 import gradio as gr
 
 from frameguard.face_reference import DEFAULT_COSINE_THRESHOLD
+from frameguard.minor_pipeline import analyze_video_with_face_policy
 from frameguard.observability import configure_application_logging
 from frameguard.pipeline import analyze_video, findings_table
 
@@ -53,6 +54,11 @@ def run_pipeline(
     reference_face_path: str | None,
     face_recognition_model_path: str,
     reference_match_threshold: float,
+    age_minor_boundary: int,
+    age_confident_adult_age: int,
+    age_minimum_confidence: float,
+    age_max_samples_per_track: int,
+    age_fail_closed: bool,
     run_log_level: str,
     show_sensitive_values: bool,
     include_raw_model_output: bool,
@@ -66,33 +72,49 @@ def run_pipeline(
             "Upload one clear reference-face image when using reference-only face redaction."
         )
 
+    common_kwargs = {
+        "api_base": api_base,
+        "model": model,
+        "api_key": DEFAULT_API_KEY,
+        "chunk_seconds": float(chunk_seconds),
+        "output_dir": OUTPUT_DIR,
+        "detector_mode": DEFAULT_DETECTOR_MODE,
+        "deterministic_ocr": bool(deterministic_ocr),
+        "detect_qr_codes": bool(detect_qr_codes),
+        "deterministic_sample_interval_ms": int(deterministic_sample_interval_ms),
+        "face_model_path": face_model_path,
+        "face_sample_interval_ms": int(face_sample_interval_ms),
+        "face_score_threshold": float(face_score_threshold),
+        "face_max_track_gap_ms": int(face_max_track_gap_ms),
+        "face_min_track_observations": int(face_min_track_observations),
+        "run_log_level": str(run_log_level),
+        "include_sensitive_values_in_report": bool(show_sensitive_values),
+        "include_raw_model_output": bool(include_raw_model_output),
+    }
+
     LOGGER.info("FrameGuard run requested")
     try:
-        result = analyze_video(
-            video_path,
-            api_base=api_base,
-            model=model,
-            api_key=DEFAULT_API_KEY,
-            chunk_seconds=float(chunk_seconds),
-            output_dir=OUTPUT_DIR,
-            detector_mode=DEFAULT_DETECTOR_MODE,
-            deterministic_ocr=bool(deterministic_ocr),
-            detect_qr_codes=bool(detect_qr_codes),
-            deterministic_sample_interval_ms=int(deterministic_sample_interval_ms),
-            redact_faces=bool(redact_faces),
-            face_model_path=face_model_path,
-            face_sample_interval_ms=int(face_sample_interval_ms),
-            face_score_threshold=float(face_score_threshold),
-            face_max_track_gap_ms=int(face_max_track_gap_ms),
-            face_min_track_observations=int(face_min_track_observations),
-            face_redaction_mode=normalized_face_mode,
-            reference_face_path=reference_face_path,
-            face_recognition_model_path=face_recognition_model_path,
-            reference_match_threshold=float(reference_match_threshold),
-            run_log_level=str(run_log_level),
-            include_sensitive_values_in_report=bool(show_sensitive_values),
-            include_raw_model_output=bool(include_raw_model_output),
-        )
+        if redact_faces and normalized_face_mode == "likely_minors":
+            result = analyze_video_with_face_policy(
+                video_path,
+                face_redaction_mode="likely_minors",
+                age_minor_boundary=int(age_minor_boundary),
+                age_confident_adult_age=int(age_confident_adult_age),
+                age_minimum_confidence=float(age_minimum_confidence),
+                age_max_samples_per_track=int(age_max_samples_per_track),
+                age_fail_closed=bool(age_fail_closed),
+                **common_kwargs,
+            )
+        else:
+            result = analyze_video(
+                video_path,
+                redact_faces=bool(redact_faces),
+                face_redaction_mode=normalized_face_mode,
+                reference_face_path=reference_face_path,
+                face_recognition_model_path=face_recognition_model_path,
+                reference_match_threshold=float(reference_match_threshold),
+                **common_kwargs,
+            )
     except Exception as exc:
         LOGGER.exception("FrameGuard run failed")
         raise gr.Error(str(exc)) from exc
@@ -103,6 +125,7 @@ def run_pipeline(
         "privacy": report_payload.get("privacy"),
         "configuration": report_payload.get("configuration"),
         "metrics": report_payload.get("metrics"),
+        "age_estimation": report_payload.get("age_estimation"),
         "findings": report_payload.get("findings"),
         "model_responses": report_payload.get("model_responses"),
         "instrumentation": report_payload.get("instrumentation"),
@@ -122,20 +145,23 @@ def run_pipeline(
     )
 
 
-with gr.Blocks(title="FrameGuard") as frameguard_app:
+with gr.Blocks(title="FrameGuard", analytics_enabled=False) as frameguard_app:
     gr.Markdown(
         """
 # FrameGuard
 
 Analyze a recording locally with Qwen2.5-Omni, deterministic OCR validation,
-and QR detection. Face redaction can blur every detected face or only the face
-matching an uploaded reference photo. Review the redacted preview, audit report,
-and privacy-safe per-run instrumentation before downloading the result.
+and QR detection. Face protection can blur every detected face, only a face
+matching an uploaded reference photo, or tracks conservatively classified as
+likely minors or age-uncertain.
 
-**Logging policy:** INFO and DEBUG logs never contain detected values, raw Qwen
-responses, prompts, credentials, media data, reference photos, or face embeddings.
-DEBUG adds safe detail such as request IDs, byte counts, response lengths, stage
-timings, and localization counts.
+**Likely-minors mode is probabilistic:** it does not establish legal age. Only a
+high-confidence adult interval above the configured safety margin remains visible;
+minor, boundary-overlap, low-quality, and model-failure tracks are blurred.
+
+**Logging policy:** INFO and DEBUG logs never contain detected secret values, raw
+Qwen responses, prompts, credentials, media data, reference photos, face crops,
+or face embeddings.
 """
     )
 
@@ -167,6 +193,7 @@ timings, and localization counts.
             choices=[
                 ("Blur every detected face", "all"),
                 ("Blur only the uploaded reference face", "reference"),
+                ("Blur likely minors and uncertain ages", "likely_minors"),
             ],
             value="all",
             label="Face redaction mode",
@@ -180,7 +207,8 @@ timings, and localization counts.
 
     gr.Markdown(
         "The reference image and derived SFace embedding are used only in memory "
-        "for the current run and are not written to FrameGuard logs or reports."
+        "for the current run. Likely-minors mode samples several crops from each "
+        "temporary YuNet track and sends them only to the local Omni endpoint."
     )
 
     with gr.Accordion("Advanced settings", open=False):
@@ -249,6 +277,49 @@ timings, and localization counts.
             value=2,
             label="Minimum observations per face track",
         )
+
+        gr.Markdown("### Likely-minors policy")
+        with gr.Row():
+            age_minor_boundary = gr.Slider(
+                minimum=13,
+                maximum=21,
+                step=1,
+                value=18,
+                label="Minor boundary",
+                info="An interval entirely below this age is classified likely minor.",
+            )
+            age_confident_adult_age = gr.Slider(
+                minimum=19,
+                maximum=30,
+                step=1,
+                value=22,
+                label="Adult safety margin",
+                info=(
+                    "A face remains visible only when the estimated interval starts "
+                    "at or above this value."
+                ),
+            )
+        with gr.Row():
+            age_minimum_confidence = gr.Slider(
+                minimum=0.5,
+                maximum=0.95,
+                step=0.01,
+                value=0.65,
+                label="Minimum age-estimation confidence",
+            )
+            age_max_samples_per_track = gr.Slider(
+                minimum=1,
+                maximum=8,
+                step=1,
+                value=5,
+                label="Age samples per face track",
+            )
+        age_fail_closed = gr.Checkbox(
+            value=True,
+            label="Blur when age estimation fails",
+            info="Recommended. A model error or unusable crop is treated as uncertain.",
+        )
+
         run_log_level = gr.Dropdown(
             choices=["INFO", "DEBUG"],
             value="INFO",
@@ -264,8 +335,8 @@ timings, and localization counts.
             value=False,
             label="Include raw Qwen output in JSON report",
             info=(
-                "Sensitive: raw model output can contain every detected secret. "
-                "It is never written to the run log."
+                "Sensitive: raw secret-detection output can contain every detected secret. "
+                "Age-estimation prompts and raw responses are never included."
             ),
         )
 
@@ -329,6 +400,11 @@ timings, and localization counts.
             reference_face,
             face_recognition_model_path,
             reference_match_threshold,
+            age_minor_boundary,
+            age_confident_adult_age,
+            age_minimum_confidence,
+            age_max_samples_per_track,
+            age_fail_closed,
             run_log_level,
             show_sensitive_values,
             include_raw_model_output,
@@ -349,4 +425,5 @@ if __name__ == "__main__":
     frameguard_app.launch(
         server_name=os.environ.get("FRAMEGUARD_HOST", "127.0.0.1"),
         server_port=int(os.environ.get("FRAMEGUARD_PORT", "7860")),
+        share=False,
     )
