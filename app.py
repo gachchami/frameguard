@@ -7,6 +7,12 @@ from pathlib import Path
 
 import gradio as gr
 
+from frameguard.face_gallery import (
+    FaceGallerySession,
+    analyze_video_with_face_gallery,
+    match_uploaded_reference_photos,
+    scan_face_gallery,
+)
 from frameguard.face_reference import DEFAULT_COSINE_THRESHOLD
 from frameguard.minor_pipeline import analyze_video_with_face_policy
 from frameguard.observability import configure_application_logging
@@ -34,6 +40,52 @@ DEFAULT_FACE_RECOGNITION_MODEL = os.environ.get(
     "FRAMEGUARD_FACE_RECOGNITION_MODEL",
     "models/face_recognition_sface_2021dec.onnx",
 )
+
+
+def _normalize_face_mode(value: object) -> str:
+    raw = str(value or "").strip().lower()
+    aliases = {
+        "all": "all",
+        "blur every detected face": "all",
+        "reference": "reference",
+        "blur only the uploaded reference face": "reference",
+        "likely_minors": "likely_minors",
+        "likely_minor": "likely_minors",
+        "blur likely minors only": "likely_minors",
+        "blur visually apparent children only": "likely_minors",
+        "blur visually apparent children only (experimental)": "likely_minors",
+    }
+    normalized = aliases.get(raw)
+    if normalized is None:
+        raise gr.Error(f"Unexpected face-redaction mode received from the UI: {value!r}")
+    return normalized
+
+
+def _result_outputs(result, *, show_sensitive_values: bool):
+    report_payload = json.loads(result.report_path.read_text(encoding="utf-8"))
+    report_preview = {
+        "run_id": report_payload.get("run_id"),
+        "privacy": report_payload.get("privacy"),
+        "configuration": report_payload.get("configuration"),
+        "metrics": report_payload.get("metrics"),
+        "face_gallery": report_payload.get("face_gallery"),
+        "child_classification": report_payload.get("child_classification"),
+        "findings": report_payload.get("findings"),
+        "model_responses": report_payload.get("model_responses"),
+        "instrumentation": report_payload.get("instrumentation"),
+    }
+    return (
+        str(result.output_video),
+        str(result.output_video),
+        findings_table(
+            result.findings,
+            show_sensitive_values=bool(show_sensitive_values),
+        ),
+        json.dumps(result.metrics, indent=2),
+        json.dumps(report_preview, indent=2),
+        str(result.report_path),
+        str(result.log_path),
+    )
 
 
 def run_pipeline(
@@ -67,7 +119,7 @@ def run_pipeline(
     if not video_path:
         raise gr.Error("Upload an MP4 video first.")
 
-    normalized_face_mode = str(face_redaction_mode).strip().lower()
+    normalized_face_mode = _normalize_face_mode(face_redaction_mode)
     if int(child_minimum_usable_timestamps) > int(child_max_samples_per_track):
         raise gr.Error(
             "Minimum usable timestamps cannot exceed maximum timestamps per track."
@@ -97,7 +149,11 @@ def run_pipeline(
         "include_raw_model_output": bool(include_raw_model_output),
     }
 
-    LOGGER.info("FrameGuard run requested")
+    LOGGER.info(
+        "FrameGuard run requested raw_face_mode=%r normalized_face_mode=%s",
+        face_redaction_mode,
+        normalized_face_mode,
+    )
     try:
         if redact_faces and normalized_face_mode == "likely_minors":
             result = analyze_video_with_face_policy(
@@ -125,55 +181,149 @@ def run_pipeline(
         LOGGER.exception("FrameGuard run failed")
         raise gr.Error(str(exc)) from exc
 
-    report_payload = json.loads(result.report_path.read_text(encoding="utf-8"))
-    report_preview = {
-        "run_id": report_payload.get("run_id"),
-        "privacy": report_payload.get("privacy"),
-        "configuration": report_payload.get("configuration"),
-        "metrics": report_payload.get("metrics"),
-        "child_classification": report_payload.get("child_classification"),
-        "findings": report_payload.get("findings"),
-        "model_responses": report_payload.get("model_responses"),
-        "instrumentation": report_payload.get("instrumentation"),
-    }
+    return _result_outputs(result, show_sensitive_values=bool(show_sensitive_values))
 
+
+def extract_face_profiles(
+    video_path: str | None,
+    face_model_path: str,
+    face_recognition_model_path: str,
+    face_sample_interval_ms: int,
+    face_score_threshold: float,
+    face_max_track_gap_ms: int,
+    face_min_track_observations: int,
+    identity_similarity_threshold: float,
+):
+    if not video_path:
+        raise gr.Error("Upload an MP4 video first.")
+
+    try:
+        session = scan_face_gallery(
+            video_path,
+            face_model_path=face_model_path,
+            face_recognition_model_path=face_recognition_model_path,
+            face_sample_interval_ms=int(face_sample_interval_ms),
+            face_score_threshold=float(face_score_threshold),
+            face_max_track_gap_ms=int(face_max_track_gap_ms),
+            face_min_track_observations=int(face_min_track_observations),
+            identity_similarity_threshold=float(identity_similarity_threshold),
+        )
+    except Exception as exc:
+        LOGGER.exception("Face-gallery extraction failed")
+        raise gr.Error(str(exc)) from exc
+
+    status = (
+        f"Extracted **{len(session.profiles)} profiles** from "
+        f"**{len(session.findings)} face-track segments**. Review the gallery, "
+        "choose the blur/keep policy, and render."
+    )
     return (
-        str(result.output_video),
-        str(result.output_video),
-        findings_table(
-            result.findings,
-            show_sensitive_values=bool(show_sensitive_values),
-        ),
-        json.dumps(result.metrics, indent=2),
-        json.dumps(report_preview, indent=2),
-        str(result.report_path),
-        str(result.log_path),
+        session,
+        session.gallery_items(),
+        gr.update(choices=session.labels, value=[]),
+        json.dumps(session.public_summary(), indent=2),
+        status,
     )
 
 
+def preview_uploaded_photo_matches(
+    session: FaceGallerySession | None,
+    uploaded_photos,
+    face_model_path: str,
+    face_recognition_model_path: str,
+    reference_match_threshold: float,
+):
+    if session is None:
+        raise gr.Error("Extract face profiles before matching uploaded photos.")
+    try:
+        matches = match_uploaded_reference_photos(
+            session,
+            uploaded_photos,
+            face_model_path=face_model_path,
+            face_recognition_model_path=face_recognition_model_path,
+            threshold=float(reference_match_threshold),
+        )
+    except Exception as exc:
+        LOGGER.exception("Uploaded-photo matching failed")
+        raise gr.Error(str(exc)) from exc
+    return json.dumps(matches, indent=2)
+
+
+def run_gallery_pipeline(
+    video_path: str | None,
+    session: FaceGallerySession | None,
+    selected_labels: list[str] | None,
+    gallery_action: str,
+    uploaded_photos,
+    uploaded_photo_action: str,
+    api_base: str,
+    model: str,
+    chunk_seconds: float,
+    deterministic_ocr: bool,
+    detect_qr_codes: bool,
+    deterministic_sample_interval_ms: int,
+    face_model_path: str,
+    face_recognition_model_path: str,
+    reference_match_threshold: float,
+    run_log_level: str,
+    show_sensitive_values: bool,
+    include_raw_model_output: bool,
+):
+    if not video_path:
+        raise gr.Error("Upload an MP4 video first.")
+    if session is None:
+        raise gr.Error("Extract face profiles before rendering a manual selection.")
+
+    common_kwargs = {
+        "api_base": api_base,
+        "model": model,
+        "api_key": DEFAULT_API_KEY,
+        "chunk_seconds": float(chunk_seconds),
+        "output_dir": OUTPUT_DIR,
+        "detector_mode": DEFAULT_DETECTOR_MODE,
+        "deterministic_ocr": bool(deterministic_ocr),
+        "detect_qr_codes": bool(detect_qr_codes),
+        "deterministic_sample_interval_ms": int(deterministic_sample_interval_ms),
+        "run_log_level": str(run_log_level),
+        "include_sensitive_values_in_report": bool(show_sensitive_values),
+        "include_raw_model_output": bool(include_raw_model_output),
+    }
+
+    try:
+        result = analyze_video_with_face_gallery(
+            video_path,
+            session=session,
+            selected_labels=selected_labels,
+            gallery_action=gallery_action,  # type: ignore[arg-type]
+            uploaded_photos=uploaded_photos,
+            uploaded_photo_action=uploaded_photo_action,  # type: ignore[arg-type]
+            face_model_path=face_model_path,
+            face_recognition_model_path=face_recognition_model_path,
+            reference_match_threshold=float(reference_match_threshold),
+            **common_kwargs,
+        )
+    except Exception as exc:
+        LOGGER.exception("Manual face-gallery render failed")
+        raise gr.Error(str(exc)) from exc
+
+    return _result_outputs(result, show_sensitive_values=bool(show_sensitive_values))
+
+
 with gr.Blocks(title="FrameGuard", analytics_enabled=False) as frameguard_app:
+    gallery_state = gr.State(value=None)
+
     gr.Markdown(
         """
 # FrameGuard
 
-FrameGuard analyzes video and audio for sensitive information, localizes visual
-content, and produces a redacted MP4 with an audit report. Face protection
-supports all-face redaction, reference-face matching, and holistic visual
-child/adult classification.
+FrameGuard analyzes video and audio for sensitive information and produces a
+redacted MP4 with a JSON audit report.
 
-The child-protection mode examines multiple timestamps for each YuNet track. At
-each timestamp, Qwen receives the marked full scene, a person-context crop, and
-a face crop. It classifies the person as visually appearing to be a child, an
-adult, or uncertain. This is a privacy heuristic and does not establish legal
-age.
-
-By default, only tracks with multi-timestamp child consensus are blurred.
-Uncertain tracks remain visible unless **Also blur uncertain classifications**
-is enabled.
-
-**Logging policy:** run logs exclude detected secret values, raw model output,
-prompts, credentials, media payloads, reference images, face crops, and face
-embeddings.
+For predictable face redaction, use **Manual face gallery**. FrameGuard extracts
+representative face profiles, groups fragmented tracks with SFace, and lets the
+user decide who is blurred or kept visible. Uploaded photos can also be matched
+against the gallery. Profile crops and embeddings stay in server-side session
+memory and are not written to the report or run log.
 """
     )
 
@@ -193,11 +343,8 @@ embeddings.
         detect_qr_codes = gr.Checkbox(value=True, label="Redact QR codes")
         redact_faces = gr.Checkbox(
             value=True,
-            label="Redact faces with YuNet",
-            info=(
-                "Runs a neural face detector on sampled frames, associates boxes into "
-                "temporary tracks, and interpolates blur positions between samples."
-            ),
+            label="Enable automatic face redaction",
+            info="Used only by the automatic analysis button.",
         )
 
     with gr.Row():
@@ -205,23 +352,21 @@ embeddings.
             choices=[
                 ("Blur every detected face", "all"),
                 ("Blur only the uploaded reference face", "reference"),
-                ("Blur visually apparent children only", "likely_minors"),
+                (
+                    "Blur visually apparent children only (experimental)",
+                    "likely_minors",
+                ),
             ],
             value="all",
-            label="Face redaction mode",
+            type="value",
+            label="Automatic face-redaction mode",
         )
         reference_face = gr.Image(
-            label="Reference face image (reference-only mode)",
+            label="Single reference face (automatic reference mode)",
             type="filepath",
             sources=["upload"],
             height=220,
         )
-
-    gr.Markdown(
-        "Reference images and SFace embeddings are held in memory for one run. "
-        "Child-protection mode sends selected full-scene, person-context, and "
-        "face views to the configured local Omni endpoint."
-    )
 
     with gr.Accordion("Advanced settings", open=False):
         api_base = gr.Textbox(label="vLLM API base", value=DEFAULT_API_BASE)
@@ -253,10 +398,18 @@ embeddings.
             maximum=0.80,
             step=0.01,
             value=DEFAULT_COSINE_THRESHOLD,
-            label="Reference-face cosine match threshold",
+            label="SFace uploaded-photo match threshold",
+            info="Higher values are stricter.",
+        )
+        identity_similarity_threshold = gr.Slider(
+            minimum=0.25,
+            maximum=0.80,
+            step=0.01,
+            value=0.45,
+            label="Face-gallery identity grouping threshold",
             info=(
-                "Higher values are stricter. OpenCV's published SFace cosine "
-                "threshold is 0.363; calibrate it on a representative validation set."
+                "Raise it when different people are merged. Lower it when the same "
+                "person appears as several profiles."
             ),
         )
         face_sample_interval_ms = gr.Slider(
@@ -265,15 +418,13 @@ embeddings.
             step=50,
             value=200,
             label="Face detection sampling interval in milliseconds",
-            info="Lower values improve coverage but run more neural inference.",
         )
         face_score_threshold = gr.Slider(
-            minimum=0.5,
+            minimum=0.50,
             maximum=0.95,
             step=0.01,
             value=0.75,
-            label="Face confidence threshold",
-            info="Lower values favor privacy recall; higher values reduce false positives.",
+            label="YuNet face confidence threshold",
         )
         face_max_track_gap_ms = gr.Slider(
             minimum=300,
@@ -290,7 +441,7 @@ embeddings.
             label="Minimum observations per face track",
         )
 
-        gr.Markdown("### Visually apparent child policy")
+        gr.Markdown("### Experimental child-classification policy")
         with gr.Row():
             child_minimum_confidence = gr.Slider(
                 minimum=0.50,
@@ -298,7 +449,6 @@ embeddings.
                 step=0.01,
                 value=0.70,
                 label="Minimum per-timestamp confidence",
-                info="Lower-confidence timestamp judgments do not count toward consensus.",
             )
             child_max_samples_per_track = gr.Slider(
                 minimum=3,
@@ -306,10 +456,6 @@ embeddings.
                 step=1,
                 value=5,
                 label="Maximum timestamps per face track",
-                info=(
-                    "The best temporally separated timestamps are selected using face "
-                    "size, detector confidence, and sharpness."
-                ),
             )
         with gr.Row():
             child_minimum_usable_timestamps = gr.Slider(
@@ -318,7 +464,6 @@ embeddings.
                 step=1,
                 value=3,
                 label="Minimum usable timestamps",
-                info="At least this many reliable judgments are required before blurring.",
             )
             child_consensus_fraction = gr.Slider(
                 minimum=0.50,
@@ -326,49 +471,101 @@ embeddings.
                 step=0.05,
                 value=0.70,
                 label="Required child/adult consensus",
-                info=(
-                    "A track must reach this fraction without an opposite-class vote. "
-                    "Mixed child/adult votes become uncertain."
-                ),
             )
         child_blur_uncertain = gr.Checkbox(
             value=False,
             label="Also blur uncertain classifications",
-            info=(
-                "Off means only tracks with strong child consensus are blurred. Turning "
-                "this on is privacy-conservative but can blur adults."
-            ),
         )
         child_continue_on_error = gr.Checkbox(
             value=True,
             label="Continue when child classification fails",
-            info=(
-                "Converts classifier errors into an uncertain result instead of stopping "
-                "the complete run. The uncertainty setting controls redaction."
-            ),
         )
 
         run_log_level = gr.Dropdown(
             choices=["INFO", "DEBUG"],
             value="INFO",
             label="Run log detail",
-            info="DEBUG remains privacy-safe; it records more timings and counts.",
         )
         show_sensitive_values = gr.Checkbox(
             value=False,
             label="Show exact detected values in UI and JSON report",
-            info="Off by default. The report otherwise stores masked previews and fingerprints.",
         )
         include_raw_model_output = gr.Checkbox(
             value=False,
             label="Include raw Qwen output in JSON report",
-            info=(
-                "Sensitive: raw secret-detection output can contain every detected secret. "
-                "Child-classification prompts and raw responses are never included."
-            ),
         )
 
-    analyze_button = gr.Button("Analyze and preview redaction", variant="primary")
+    with gr.Accordion("Manual face gallery", open=True):
+        gr.Markdown(
+            """
+1. Click **Extract face profiles**.
+2. Review the profile gallery and select people.
+3. Choose whether selected people are blurred or kept visible.
+4. Optionally upload reference photos and choose whether their matches are
+   blurred or kept visible.
+5. Click **Render manual face selection**.
+"""
+        )
+        extract_profiles_button = gr.Button("Extract face profiles")
+        gallery_status = gr.Markdown()
+        face_gallery = gr.Gallery(
+            label="Detected face profiles",
+            columns=5,
+            rows=2,
+            height="auto",
+            object_fit="contain",
+            preview=True,
+        )
+        gallery_choices = gr.CheckboxGroup(
+            choices=[],
+            label="Selected gallery people",
+        )
+
+        with gr.Row():
+            gallery_action = gr.Radio(
+                choices=[
+                    ("Blur selected gallery people", "blur_selected"),
+                    (
+                        "Keep selected gallery people visible; blur everyone else",
+                        "keep_selected_visible",
+                    ),
+                ],
+                value="blur_selected",
+                type="value",
+                label="Gallery selection action",
+            )
+            uploaded_photo_action = gr.Radio(
+                choices=[
+                    ("Blur people matching uploaded photos", "blur"),
+                    ("Keep people matching uploaded photos visible", "keep_visible"),
+                ],
+                value="blur",
+                type="value",
+                label="Uploaded-photo action",
+            )
+
+        uploaded_reference_faces = gr.File(
+            label="Optional reference photos",
+            file_count="multiple",
+            file_types=["image"],
+            type="filepath",
+        )
+        with gr.Row():
+            preview_matches_button = gr.Button("Preview uploaded-photo matches")
+            render_gallery_button = gr.Button(
+                "Render manual face selection",
+                variant="primary",
+            )
+        gallery_summary = gr.Code(label="Face-gallery summary", language="json")
+        uploaded_match_preview = gr.Code(
+            label="Uploaded-photo match preview",
+            language="json",
+        )
+
+    automatic_button = gr.Button(
+        "Run automatic analysis and redaction",
+        variant="secondary",
+    )
 
     findings = gr.Dataframe(
         headers=[
@@ -408,7 +605,73 @@ embeddings.
         report_download = gr.File(label="Download JSON audit report")
         log_download = gr.File(label="Download privacy-safe run log")
 
-    analyze_button.click(
+    extract_profiles_button.click(
+        fn=extract_face_profiles,
+        inputs=[
+            input_video,
+            face_model_path,
+            face_recognition_model_path,
+            face_sample_interval_ms,
+            face_score_threshold,
+            face_max_track_gap_ms,
+            face_min_track_observations,
+            identity_similarity_threshold,
+        ],
+        outputs=[
+            gallery_state,
+            face_gallery,
+            gallery_choices,
+            gallery_summary,
+            gallery_status,
+        ],
+    )
+
+    preview_matches_button.click(
+        fn=preview_uploaded_photo_matches,
+        inputs=[
+            gallery_state,
+            uploaded_reference_faces,
+            face_model_path,
+            face_recognition_model_path,
+            reference_match_threshold,
+        ],
+        outputs=[uploaded_match_preview],
+    )
+
+    render_gallery_button.click(
+        fn=run_gallery_pipeline,
+        inputs=[
+            input_video,
+            gallery_state,
+            gallery_choices,
+            gallery_action,
+            uploaded_reference_faces,
+            uploaded_photo_action,
+            api_base,
+            model,
+            chunk_seconds,
+            deterministic_ocr,
+            detect_qr_codes,
+            deterministic_sample_interval_ms,
+            face_model_path,
+            face_recognition_model_path,
+            reference_match_threshold,
+            run_log_level,
+            show_sensitive_values,
+            include_raw_model_output,
+        ],
+        outputs=[
+            output_video,
+            redacted_download,
+            findings,
+            metrics,
+            report_preview,
+            report_download,
+            log_download,
+        ],
+    )
+
+    automatic_button.click(
         fn=run_pipeline,
         inputs=[
             input_video,
