@@ -72,8 +72,21 @@ class FaceGallerySession:
     def all_person_ids(self) -> set[str]:
         return {profile.person_id for profile in self.profiles}
 
-    def gallery_items(self) -> list[tuple[np.ndarray, str]]:
-        return [(profile.portrait_rgb, profile.label) for profile in self.profiles]
+    def gallery_items(
+        self,
+        selected_labels: Sequence[str] | None = None,
+    ) -> list[tuple[np.ndarray, str]]:
+        selected = set(selected_labels or [])
+        return [
+            (
+                _selection_card(
+                    profile.portrait_rgb,
+                    selected=profile.label in selected,
+                ),
+                profile.label,
+            )
+            for profile in self.profiles
+        ]
 
     def public_summary(self) -> dict[str, object]:
         return {
@@ -187,52 +200,243 @@ def _square_face_crop(
     return frame_bgr[y1:y2, x1:x2].copy()
 
 
-def _representative_observation(finding: Finding) -> BoxObservation:
-    if not finding.observations:
-        raise ValueError(f"Face track {finding.value!r} has no observations.")
-    return max(
-        finding.observations,
-        key=lambda item: (
-            item.width * item.height * max(item.confidence, 0.01),
-            item.confidence,
-        ),
+def _observation_priority(observation: BoxObservation) -> float:
+    return float(
+        np.sqrt(max(1, observation.width * observation.height))
+        * max(0.01, observation.confidence)
     )
 
 
-def _read_frame(capture: cv2.VideoCapture, time_ms: int) -> np.ndarray:
-    capture.set(cv2.CAP_PROP_POS_MSEC, max(0, int(time_ms)))
-    ok, frame = capture.read()
-    if not ok or frame is None:
-        raise ValueError(f"Could not read video frame at {time_ms} ms.")
-    return frame
+def _candidate_observations(
+    finding: Finding,
+    *,
+    maximum: int = 8,
+    minimum_spacing_ms: int = 350,
+) -> list[BoxObservation]:
+    """Choose strong, temporally diverse observations before decoding frames."""
+
+    if not finding.observations:
+        raise ValueError(f"Face track {finding.value!r} has no observations.")
+
+    selected: list[BoxObservation] = []
+    for observation in sorted(
+        finding.observations,
+        key=_observation_priority,
+        reverse=True,
+    ):
+        if any(
+            abs(observation.time_ms - existing.time_ms) < minimum_spacing_ms
+            for existing in selected
+        ):
+            continue
+        selected.append(observation)
+        if len(selected) >= maximum:
+            break
+
+    if not selected:
+        selected.append(max(finding.observations, key=_observation_priority))
+    return sorted(selected, key=lambda item: item.time_ms)
 
 
-def _portrait_card(crop_bgr: np.ndarray, *, size: int = 224) -> np.ndarray:
+def _read_frames_sequentially(
+    video_path: str | Path,
+    requested_times_ms: Sequence[int],
+) -> dict[int, np.ndarray]:
+    """Decode the video once instead of repeatedly seeking inside H.264.
+
+    Repeated ``CAP_PROP_POS_MSEC`` seeks can trigger FFmpeg ``mmco`` warnings
+    and can return damaged reference frames. Sequential decoding is slower than
+    a single seek but more reliable for a gallery extraction pass.
+    """
+
+    targets = sorted({max(0, int(value)) for value in requested_times_ms})
+    if not targets:
+        return {}
+
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        raise ValueError(f"Could not open video for face-gallery extraction: {video_path}")
+
+    fps = float(capture.get(cv2.CAP_PROP_FPS))
+    if not np.isfinite(fps) or fps <= 0:
+        fps = 30.0
+
+    results: dict[int, np.ndarray] = {}
+    target_index = 0
+    frame_index = 0
+    try:
+        while target_index < len(targets):
+            ok, frame = capture.read()
+            if not ok or frame is None:
+                break
+
+            position_ms = float(capture.get(cv2.CAP_PROP_POS_MSEC))
+            if not np.isfinite(position_ms) or position_ms <= 0:
+                position_ms = frame_index * 1000.0 / fps
+
+            while target_index < len(targets) and position_ms >= targets[target_index]:
+                results[targets[target_index]] = frame.copy()
+                target_index += 1
+            frame_index += 1
+    finally:
+        capture.release()
+
+    return results
+
+
+def _portrait_card(crop_bgr: np.ndarray, *, size: int = 288) -> np.ndarray:
+    """Create a large, square RGB gallery image with the face filling the card."""
+
     if crop_bgr.size == 0:
         return np.zeros((size, size, 3), dtype=np.uint8)
 
     height, width = crop_bgr.shape[:2]
-    scale = min(size / max(width, 1), size / max(height, 1))
-    resized_width = max(1, int(round(width * scale)))
-    resized_height = max(1, int(round(height * scale)))
+    scale = max(size / max(width, 1), size / max(height, 1))
+    resized_width = max(size, int(round(width * scale)))
+    resized_height = max(size, int(round(height * scale)))
     resized = cv2.resize(
         crop_bgr,
         (resized_width, resized_height),
         interpolation=cv2.INTER_CUBIC,
     )
-    canvas = np.full((size, size, 3), 24, dtype=np.uint8)
-    x = (size - resized_width) // 2
-    y = (size - resized_height) // 2
-    canvas[y : y + resized_height, x : x + resized_width] = resized
-    return cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+
+    x1 = max(0, (resized_width - size) // 2)
+    y1 = max(0, (resized_height - size) // 2)
+    card = resized[y1 : y1 + size, x1 : x1 + size].copy()
+    return cv2.cvtColor(card, cv2.COLOR_BGR2RGB)
 
 
-def _profile_quality(finding: Finding, observation: BoxObservation) -> float:
+def _selection_card(image_rgb: np.ndarray, *, selected: bool) -> np.ndarray:
+    """Add an unmistakable visual selection state directly to a gallery card."""
+
+    card = np.asarray(image_rgb, dtype=np.uint8).copy()
+    if not selected:
+        return card
+
+    height, width = card.shape[:2]
+    border = max(6, min(height, width) // 30)
+    selected_rgb = (34, 197, 94)
+    cv2.rectangle(
+        card,
+        (border // 2, border // 2),
+        (width - border // 2 - 1, height - border // 2 - 1),
+        selected_rgb,
+        border,
+    )
+
+    banner_height = max(32, height // 7)
+    overlay = card.copy()
+    cv2.rectangle(
+        overlay,
+        (0, height - banner_height),
+        (width, height),
+        selected_rgb,
+        thickness=-1,
+    )
+    card = cv2.addWeighted(overlay, 0.88, card, 0.12, 0)
+    cv2.putText(
+        card,
+        "SELECTED",
+        (max(8, width // 18), height - max(9, banner_height // 4)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        max(0.55, width / 420.0),
+        (255, 255, 255),
+        max(1, border // 3),
+        cv2.LINE_AA,
+    )
+    return card
+
+
+def _sharpness(crop_bgr: np.ndarray) -> float:
+    if crop_bgr.size == 0:
+        return 0.0
+    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+def _candidate_quality(
+    observation: BoxObservation,
+    crop_bgr: np.ndarray,
+) -> float:
+    """Combine source resolution, sharpness, and YuNet confidence."""
+
+    minimum_face_dimension = max(1, min(observation.width, observation.height))
+    size_score = min(1.0, minimum_face_dimension / 96.0)
+    sharpness_score = min(1.0, _sharpness(crop_bgr) / 150.0)
+    detector_score = min(1.0, max(0.0, observation.confidence))
     return float(
-        np.sqrt(max(1, observation.width * observation.height))
-        * max(0.01, observation.confidence)
+        0.40 * size_score
+        + 0.38 * sharpness_score
+        + 0.22 * detector_score
+    )
+
+
+def _normalized_embedding_mean(
+    weighted_embeddings: Sequence[tuple[np.ndarray, float]],
+) -> np.ndarray | None:
+    if not weighted_embeddings:
+        return None
+    vectors = np.stack([item[0] for item in weighted_embeddings])
+    weights = np.asarray(
+        [max(0.05, float(item[1])) for item in weighted_embeddings],
+        dtype=np.float32,
+    )
+    centroid = np.average(vectors, axis=0, weights=weights).astype(np.float32)
+    norm = float(np.linalg.norm(centroid))
+    if not np.isfinite(norm) or norm <= 1e-8:
+        return None
+    return centroid / norm
+
+
+def _profile_quality(
+    finding: Finding,
+    observation: BoxObservation,
+    crop_bgr: np.ndarray,
+) -> float:
+    return float(
+        _candidate_quality(observation, crop_bgr)
         * np.log1p(max(1, len(finding.observations)))
     )
+
+
+def _track_times(item: _TrackProfile) -> tuple[int, int]:
+    return (
+        int(getattr(item.finding, "start_ms", 0)),
+        int(getattr(item.finding, "end_ms", 0)),
+    )
+
+
+def _clusters_temporally_compatible(
+    first: Sequence[_TrackProfile],
+    second: Sequence[_TrackProfile],
+    *,
+    maximum_overlap_ms: int = 350,
+) -> bool:
+    """Two simultaneously visible tracks must not become one identity."""
+
+    for first_item in first:
+        first_start, first_end = _track_times(first_item)
+        for second_item in second:
+            second_start, second_end = _track_times(second_item)
+            overlap = min(first_end, second_end) - max(first_start, second_start)
+            if overlap > maximum_overlap_ms:
+                return False
+    return True
+
+
+def _cluster_centroid(cluster: Sequence[_TrackProfile]) -> np.ndarray | None:
+    embeddings = [
+        item.embedding
+        for item in cluster
+        if item.embedding is not None
+    ]
+    if not embeddings:
+        return None
+    centroid = np.mean(np.stack(embeddings), axis=0).astype(np.float32)
+    norm = float(np.linalg.norm(centroid))
+    if not np.isfinite(norm) or norm <= 1e-8:
+        return None
+    return centroid / norm
 
 
 def _cluster_track_profiles(
@@ -240,42 +444,54 @@ def _cluster_track_profiles(
     *,
     similarity_threshold: float,
 ) -> list[list[_TrackProfile]]:
-    """Greedily group fragmented tracks using normalized SFace centroids."""
+    """Merge duplicate track fragments into unique people.
+
+    The highest-similarity compatible cluster pair is merged repeatedly.
+    Temporal overlap prevents two concurrently visible people from being
+    collapsed into one profile.
+    """
 
     threshold = max(-1.0, min(1.0, float(similarity_threshold)))
-    ordered = sorted(track_profiles, key=lambda item: item.quality_score, reverse=True)
-    clusters: list[list[_TrackProfile]] = []
-    centroids: list[np.ndarray | None] = []
+    clusters: list[list[_TrackProfile]] = [
+        [item]
+        for item in sorted(
+            track_profiles,
+            key=lambda item: item.quality_score,
+            reverse=True,
+        )
+    ]
 
-    for item in ordered:
-        if item.embedding is None:
-            clusters.append([item])
-            centroids.append(None)
-            continue
+    while True:
+        best_pair: tuple[int, int] | None = None
+        best_similarity = threshold
 
-        best_index: int | None = None
-        best_similarity = -1.0
-        for index, centroid in enumerate(centroids):
-            if centroid is None:
+        centroids = [_cluster_centroid(cluster) for cluster in clusters]
+        for first_index in range(len(clusters)):
+            first_centroid = centroids[first_index]
+            if first_centroid is None:
                 continue
-            similarity = cosine_similarity(item.embedding, centroid)
-            if similarity > best_similarity:
-                best_index = index
-                best_similarity = similarity
 
-        if best_index is None or best_similarity < threshold:
-            clusters.append([item])
-            centroids.append(item.embedding.copy())
-            continue
+            for second_index in range(first_index + 1, len(clusters)):
+                second_centroid = centroids[second_index]
+                if second_centroid is None:
+                    continue
+                if not _clusters_temporally_compatible(
+                    clusters[first_index],
+                    clusters[second_index],
+                ):
+                    continue
 
-        clusters[best_index].append(item)
-        embeddings = [
-            member.embedding
-            for member in clusters[best_index]
-            if member.embedding is not None
-        ]
-        centroid = np.mean(np.stack(embeddings), axis=0).astype(np.float32)
-        centroids[best_index] = centroid / max(float(np.linalg.norm(centroid)), 1e-8)
+                similarity = cosine_similarity(first_centroid, second_centroid)
+                if similarity > best_similarity:
+                    best_similarity = similarity
+                    best_pair = (first_index, second_index)
+
+        if best_pair is None:
+            break
+
+        first_index, second_index = best_pair
+        clusters[first_index].extend(clusters[second_index])
+        del clusters[second_index]
 
     return clusters
 
@@ -292,11 +508,13 @@ def _profile_from_cluster(
         for finding in findings
         for observation in finding.observations
     ]
-    embeddings = [item.embedding for item in cluster if item.embedding is not None]
-    centroid: np.ndarray | None = None
-    if embeddings:
-        centroid = np.mean(np.stack(embeddings), axis=0).astype(np.float32)
-        centroid /= max(float(np.linalg.norm(centroid)), 1e-8)
+    centroid = _normalized_embedding_mean(
+        [
+            (item.embedding, item.quality_score)
+            for item in cluster
+            if item.embedding is not None
+        ]
+    )
 
     first_seen = min(item.start_ms for item in findings)
     last_seen = max(item.end_ms for item in findings)
@@ -331,7 +549,7 @@ def scan_face_gallery(
     face_score_threshold: float = 0.75,
     face_max_track_gap_ms: int = 900,
     face_min_track_observations: int = 2,
-    identity_similarity_threshold: float = 0.45,
+    identity_similarity_threshold: float = 0.40,
     recorder: RunEventRecorder | None = None,
 ) -> FaceGallerySession:
     """Extract representative faces and group fragmented temporal tracks."""
@@ -352,34 +570,91 @@ def scan_face_gallery(
         face_model_path=face_model_path,
         recognition_model_path=face_recognition_model_path,
     )
-    capture = cv2.VideoCapture(str(video_path))
-    if not capture.isOpened():
-        raise ValueError(f"Could not open video for face-gallery extraction: {video_path}")
+
+    candidates_by_track = {
+        finding.value: _candidate_observations(finding)
+        for finding in scan.findings
+    }
+    requested_times = [
+        observation.time_ms
+        for observations in candidates_by_track.values()
+        for observation in observations
+    ]
+    frames_by_time = _read_frames_sequentially(video_path, requested_times)
 
     track_profiles: list[_TrackProfile] = []
     embedding_failures = 0
-    try:
-        for finding in scan.findings:
-            observation = _representative_observation(finding)
-            frame = _read_frame(capture, observation.time_ms)
-            crop = _square_face_crop(frame, observation)
-            portrait = _portrait_card(crop)
-            embedding: np.ndarray | None
-            try:
-                embedding = encoder.encode(crop)
-            except (ValueError, cv2.error):
-                embedding = None
-                embedding_failures += 1
+    tracks_without_frames = 0
+
+    for finding in scan.findings:
+        candidate_rows: list[
+            tuple[float, BoxObservation, np.ndarray, np.ndarray]
+        ] = []
+        for observation in candidates_by_track[finding.value]:
+            frame = frames_by_time.get(observation.time_ms)
+            if frame is None:
+                continue
+
+            identity_crop = _square_face_crop(
+                frame,
+                observation,
+                margin=0.42,
+            )
+            display_crop = _square_face_crop(
+                frame,
+                observation,
+                margin=0.18,
+            )
+            if identity_crop.size == 0 or display_crop.size == 0:
+                continue
+
+            quality = _profile_quality(
+                finding,
+                observation,
+                identity_crop,
+            )
+            candidate_rows.append(
+                (
+                    quality,
+                    observation,
+                    identity_crop,
+                    display_crop,
+                )
+            )
+
+        if not candidate_rows:
+            tracks_without_frames += 1
             track_profiles.append(
                 _TrackProfile(
                     finding=finding,
-                    portrait_rgb=portrait,
-                    embedding=embedding,
-                    quality_score=_profile_quality(finding, observation),
+                    portrait_rgb=np.zeros((288, 288, 3), dtype=np.uint8),
+                    embedding=None,
+                    quality_score=0.0,
                 )
             )
-    finally:
-        capture.release()
+            continue
+
+        candidate_rows.sort(key=lambda item: item[0], reverse=True)
+        best_quality, _, _, best_display_crop = candidate_rows[0]
+        portrait = _portrait_card(best_display_crop)
+
+        weighted_embeddings: list[tuple[np.ndarray, float]] = []
+        for quality, _, identity_crop, _ in candidate_rows[:3]:
+            try:
+                weighted_embeddings.append(
+                    (encoder.encode(identity_crop), quality)
+                )
+            except (ValueError, cv2.error):
+                embedding_failures += 1
+
+        track_profiles.append(
+            _TrackProfile(
+                finding=finding,
+                portrait_rgb=portrait,
+                embedding=_normalized_embedding_mean(weighted_embeddings),
+                quality_score=best_quality,
+            )
+        )
 
     clusters = _cluster_track_profiles(
         track_profiles,
@@ -407,6 +682,8 @@ def scan_face_gallery(
         "face_track_segments": scan.tracks,
         "rejected_face_tracks": scan.rejected_tracks,
         "gallery_identities": len(profiles),
+        "duplicate_track_segments_merged": max(0, len(scan.findings) - len(profiles)),
+        "tracks_without_decoded_profile_frame": tracks_without_frames,
         "tracks_with_sface_embedding": sum(
             item.embedding is not None for item in track_profiles
         ),

@@ -212,14 +212,16 @@ def extract_face_profiles(
         LOGGER.exception("Face-gallery extraction failed")
         raise gr.Error(str(exc)) from exc
 
+    merged_count = max(0, len(session.findings) - len(session.profiles))
     status = (
-        f"Extracted **{len(session.profiles)} profiles** from "
-        f"**{len(session.findings)} face-track segments**. Review the gallery, "
-        "choose the blur/keep policy, and render."
+        f"Found **{len(session.profiles)} unique people** from "
+        f"**{len(session.findings)} face-track fragments**. "
+        f"Merged **{merged_count} duplicate fragments**. "
+        "Click a face card to select or deselect it."
     )
     return (
         session,
-        session.gallery_items(),
+        session.gallery_items(selected_labels=[]),
         gr.update(choices=session.labels, value=[]),
         json.dumps(session.public_summary(), indent=2),
         status,
@@ -319,16 +321,75 @@ def run_gallery_pipeline(
 
 
 
+def _ordered_selected_labels(
+    session: FaceGallerySession,
+    selected_labels: list[str] | None,
+) -> list[str]:
+    selected = set(selected_labels or [])
+    return [
+        profile.label
+        for profile in session.profiles
+        if profile.label in selected
+    ]
+
+
 def select_all_gallery_profiles(
     session: FaceGallerySession | None,
+    gallery_action: str,
 ):
     if session is None:
         raise gr.Error("Detect people before selecting profiles.")
-    return gr.update(value=session.labels)
+    selected = session.labels
+    return (
+        gr.update(value=selected),
+        session.gallery_items(selected),
+        describe_gallery_selection(session, selected, gallery_action),
+    )
 
 
-def clear_gallery_profiles():
-    return gr.update(value=[])
+def clear_gallery_profiles(
+    session: FaceGallerySession | None,
+    gallery_action: str,
+):
+    if session is None:
+        return (
+            gr.update(value=[]),
+            [],
+            "No face profiles have been extracted yet.",
+        )
+    return (
+        gr.update(value=[]),
+        session.gallery_items([]),
+        describe_gallery_selection(session, [], gallery_action),
+    )
+
+
+def toggle_gallery_profile(
+    session: FaceGallerySession | None,
+    selected_labels: list[str] | None,
+    gallery_action: str,
+    event: gr.SelectData,
+):
+    if session is None:
+        raise gr.Error("Detect people before selecting profiles.")
+
+    index = event.index[0] if isinstance(event.index, tuple) else int(event.index)
+    if index < 0 or index >= len(session.profiles):
+        raise gr.Error(f"Invalid face-gallery selection index: {index}")
+
+    clicked_label = session.profiles[index].label
+    selected = set(selected_labels or [])
+    if clicked_label in selected:
+        selected.remove(clicked_label)
+    else:
+        selected.add(clicked_label)
+
+    ordered = _ordered_selected_labels(session, list(selected))
+    return (
+        gr.update(value=ordered),
+        session.gallery_items(ordered),
+        describe_gallery_selection(session, ordered, gallery_action),
+    )
 
 
 def describe_gallery_selection(
@@ -339,19 +400,30 @@ def describe_gallery_selection(
     if session is None:
         return "No face profiles have been extracted yet."
 
-    selected_count = len(selected_labels or [])
+    selected = _ordered_selected_labels(session, selected_labels)
+    selected_count = len(selected)
     total_count = len(session.profiles)
+    selected_names = ", ".join(
+        label.split("|", 1)[0].strip()
+        for label in selected
+    ) or "none"
+
     if gallery_action == "blur_selected":
-        return (
-            f"**Current rule:** blur {selected_count} checked person"
-            f"{'s' if selected_count != 1 else ''}; keep the other "
-            f"{max(0, total_count - selected_count)} visible."
+        rule = (
+            f"blur {selected_count} selected person"
+            f"{'s' if selected_count != 1 else ''}; keep "
+            f"{max(0, total_count - selected_count)} visible"
+        )
+    else:
+        rule = (
+            f"keep {selected_count} selected person"
+            f"{'s' if selected_count != 1 else ''} visible; blur "
+            f"{max(0, total_count - selected_count)}"
         )
 
     return (
-        f"**Current rule:** keep {selected_count} checked person"
-        f"{'s' if selected_count != 1 else ''} visible; blur the other "
-        f"{max(0, total_count - selected_count)}."
+        f"**Current rule:** {rule}.  \n"
+        f"**Selected:** {selected_names}"
     )
 
 
@@ -386,7 +458,6 @@ APP_CSS = """
 with gr.Blocks(
     title="FrameGuard",
     analytics_enabled=False,
-    css=APP_CSS,
 ) as frameguard_app:
     gallery_state = gr.State(value=None)
 
@@ -453,17 +524,19 @@ uses SFace to group track fragments that appear to belong to the same person.
                     """
 ### 2. Review and choose people
 
-The cards below are visual references. Check the corresponding person IDs in
-the list, then choose what should happen to the checked people.
+Click a face card to select or deselect that person. Selected cards receive a
+green border and a visible **SELECTED** banner. The gallery contains unique
+people, while the details panel reports how many raw track fragments were merged.
 """
                 )
                 face_gallery = gr.Gallery(
-                    label="Detected people",
-                    columns=5,
+                    label="Detected unique people — click cards to select",
+                    columns=4,
                     rows=2,
-                    height="auto",
-                    object_fit="contain",
+                    height=620,
+                    object_fit="cover",
                     preview=True,
+                    format="png",
                 )
 
                 gallery_action = gr.Radio(
@@ -481,7 +554,8 @@ the list, then choose what should happen to the checked people.
 
                 gallery_choices = gr.CheckboxGroup(
                     choices=[],
-                    label="People checked for the rule above",
+                    label="Selected people",
+                    visible=False,
                 )
                 with gr.Row():
                     select_all_button = gr.Button("Check all")
@@ -678,8 +752,8 @@ when tuning detection, grouping, or model connectivity.
                         minimum=0.25,
                         maximum=0.80,
                         step=0.01,
-                        value=0.45,
-                        label="Gallery grouping threshold",
+                        value=0.40,
+                        label="Gallery deduplication threshold",
                         info="Raise when different people merge; lower when one person splits.",
                     )
                 with gr.Row():
@@ -802,30 +876,24 @@ when tuning detection, grouping, or model connectivity.
         outputs=[selection_summary],
     )
 
+    face_gallery.select(
+        fn=toggle_gallery_profile,
+        inputs=[gallery_state, gallery_choices, gallery_action],
+        outputs=[gallery_choices, face_gallery, selection_summary],
+    )
+
     select_all_button.click(
         fn=select_all_gallery_profiles,
-        inputs=[gallery_state],
-        outputs=[gallery_choices],
-    ).then(
-        fn=describe_gallery_selection,
-        inputs=[gallery_state, gallery_choices, gallery_action],
-        outputs=[selection_summary],
+        inputs=[gallery_state, gallery_action],
+        outputs=[gallery_choices, face_gallery, selection_summary],
     )
 
     clear_selection_button.click(
         fn=clear_gallery_profiles,
-        outputs=[gallery_choices],
-    ).then(
-        fn=describe_gallery_selection,
-        inputs=[gallery_state, gallery_choices, gallery_action],
-        outputs=[selection_summary],
+        inputs=[gallery_state, gallery_action],
+        outputs=[gallery_choices, face_gallery, selection_summary],
     )
 
-    gallery_choices.change(
-        fn=describe_gallery_selection,
-        inputs=[gallery_state, gallery_choices, gallery_action],
-        outputs=[selection_summary],
-    )
     gallery_action.change(
         fn=describe_gallery_selection,
         inputs=[gallery_state, gallery_choices, gallery_action],
@@ -930,4 +998,5 @@ if __name__ == "__main__":
         server_name=os.environ.get("FRAMEGUARD_HOST", "127.0.0.1"),
         server_port=int(os.environ.get("FRAMEGUARD_PORT", "7860")),
         share=False,
+        css=APP_CSS,
     )

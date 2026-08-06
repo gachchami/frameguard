@@ -16,6 +16,8 @@ from frameguard.face_gallery import (
 @dataclass
 class DummyFinding:
     value: str
+    start_ms: int = 0
+    end_ms: int = 1000
 
 
 def embedding(*values: float) -> np.ndarray:
@@ -54,19 +56,31 @@ def gallery_session() -> FaceGallerySession:
 
 def test_cluster_groups_similar_embeddings() -> None:
     first = _TrackProfile(
-        finding=DummyFinding("face_001"),  # type: ignore[arg-type]
+        finding=DummyFinding(
+            "face_001",
+            start_ms=0,
+            end_ms=1000,
+        ),  # type: ignore[arg-type]
         portrait_rgb=np.zeros((4, 4, 3), dtype=np.uint8),
         embedding=embedding(1.0, 0.0),
         quality_score=10.0,
     )
     second = _TrackProfile(
-        finding=DummyFinding("face_002"),  # type: ignore[arg-type]
+        finding=DummyFinding(
+            "face_002",
+            start_ms=1200,
+            end_ms=2200,
+        ),  # type: ignore[arg-type]
         portrait_rgb=np.zeros((4, 4, 3), dtype=np.uint8),
         embedding=embedding(0.99, 0.05),
         quality_score=9.0,
     )
     third = _TrackProfile(
-        finding=DummyFinding("face_003"),  # type: ignore[arg-type]
+        finding=DummyFinding(
+            "face_003",
+            start_ms=200,
+            end_ms=1800,
+        ),  # type: ignore[arg-type]
         portrait_rgb=np.zeros((4, 4, 3), dtype=np.uint8),
         embedding=embedding(0.0, 1.0),
         quality_score=8.0,
@@ -128,3 +142,35 @@ def test_uploaded_keep_visible_removes_identity() -> None:
         uploaded_photo_action="keep_visible",
     )
     assert value == {"person_01", "person_03"}
+
+
+
+def test_cluster_does_not_merge_simultaneously_visible_faces() -> None:
+    first = _TrackProfile(
+        finding=DummyFinding("face_001", start_ms=0, end_ms=2000),  # type: ignore[arg-type]
+        portrait_rgb=np.zeros((4, 4, 3), dtype=np.uint8),
+        embedding=embedding(1.0, 0.0),
+        quality_score=10.0,
+    )
+    second = _TrackProfile(
+        finding=DummyFinding("face_002", start_ms=200, end_ms=1800),  # type: ignore[arg-type]
+        portrait_rgb=np.zeros((4, 4, 3), dtype=np.uint8),
+        embedding=embedding(0.999, 0.01),
+        quality_score=9.0,
+    )
+
+    clusters = _cluster_track_profiles(
+        [first, second],
+        similarity_threshold=0.8,
+    )
+
+    assert len(clusters) == 2
+
+
+def test_selected_gallery_card_is_visually_different() -> None:
+    gallery = gallery_session()
+    normal = gallery.gallery_items([])[0][0]
+    selected = gallery.gallery_items(["Person 01"])[0][0]
+
+    assert normal.shape == selected.shape
+    assert not np.array_equal(normal, selected)
