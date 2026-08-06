@@ -184,6 +184,53 @@ def run_pipeline(
     return _result_outputs(result, show_sensitive_values=bool(show_sensitive_values))
 
 
+def run_sensitive_content_pipeline(
+    video_path: str | None,
+    api_base: str,
+    model: str,
+    chunk_seconds: float,
+    deterministic_ocr: bool,
+    detect_qr_codes: bool,
+    deterministic_sample_interval_ms: int,
+    run_log_level: str,
+    show_sensitive_values: bool,
+    include_raw_model_output: bool,
+):
+    """Protect visual and spoken secrets without enabling face redaction."""
+
+    if not video_path:
+        raise gr.Error("Upload an MP4 video in the Sensitive Content section.")
+
+    try:
+        result = analyze_video(
+            video_path,
+            api_base=api_base,
+            model=model,
+            api_key=DEFAULT_API_KEY,
+            chunk_seconds=float(chunk_seconds),
+            output_dir=OUTPUT_DIR,
+            detector_mode=DEFAULT_DETECTOR_MODE,
+            deterministic_ocr=bool(deterministic_ocr),
+            detect_qr_codes=bool(detect_qr_codes),
+            deterministic_sample_interval_ms=int(
+                deterministic_sample_interval_ms
+            ),
+            redact_faces=False,
+            run_log_level=str(run_log_level),
+            include_sensitive_values_in_report=bool(show_sensitive_values),
+            include_raw_model_output=bool(include_raw_model_output),
+        )
+    except Exception as exc:
+        LOGGER.exception("Sensitive-content protection failed")
+        raise gr.Error(str(exc)) from exc
+
+    return _result_outputs(
+        result,
+        show_sensitive_values=bool(show_sensitive_values),
+    )
+
+
+
 def extract_face_profiles(
     video_path: str | None,
     face_model_path: str,
@@ -438,6 +485,12 @@ APP_CSS = """
 .frameguard-hero {
     padding: 0.4rem 0 0.2rem 0;
 }
+.product-path {
+    border: 1px solid var(--border-color-primary);
+    border-radius: 14px;
+    padding: 1rem;
+    margin-bottom: 0.85rem;
+}
 .step-card {
     border: 1px solid var(--border-color-primary);
     border-radius: 12px;
@@ -452,7 +505,12 @@ APP_CSS = """
     border-left: 4px solid var(--color-accent);
     padding-left: 0.8rem;
 }
+.section-kicker {
+    color: var(--body-text-color-subdued);
+    margin-top: -0.35rem;
+}
 """
+
 
 
 with gr.Blocks(
@@ -460,260 +518,405 @@ with gr.Blocks(
     analytics_enabled=False,
 ) as frameguard_app:
     gallery_state = gr.State(value=None)
+    face_redaction_enabled = gr.State(value=True)
+    face_secret_ocr_disabled = gr.State(value=False)
+    face_secret_qr_disabled = gr.State(value=False)
 
     gr.Markdown(
         """
 # FrameGuard
 
-Upload a video, review the people FrameGuard detects, and decide exactly who
-should be blurred. Text, secrets, QR codes, video, and audio are analyzed during
-the final render.
+FrameGuard provides two independent video-privacy workflows:
+
+1. **Sensitive Content** detects and redacts exposed secrets in video, text,
+   QR codes, and audio.
+2. **Face Privacy** detects people and blurs selected or automatically matched
+   faces.
 """,
         elem_classes=["frameguard-hero"],
     )
 
-    input_video = gr.Video(
-        label="Video to protect",
-        sources=["upload"],
-        format="mp4",
-    )
-
-    with gr.Row():
-        deterministic_ocr = gr.Checkbox(
-            value=True,
-            label="Redact sensitive text",
-            info="Emails, IP addresses, API keys, account IDs, phone numbers, and private URLs.",
-        )
-        detect_qr_codes = gr.Checkbox(
-            value=True,
-            label="Redact QR codes",
-        )
-
     with gr.Tabs():
-        with gr.Tab("Review people", id="review-people"):
+        # ------------------------------------------------------------------
+        # 1. Sensitive Content
+        # ------------------------------------------------------------------
+        with gr.Tab("Sensitive Content", id="sensitive-content"):
             gr.Markdown(
                 """
-### Recommended workflow
+## Protect secrets in video
 
-Use this when accuracy and control matter. Face profiles and embeddings remain
-in the current server session and are not stored in the audit report.
+Use this section for API keys, email addresses, IP addresses, account IDs,
+phone numbers, private URLs, QR codes, and sensitive spoken information.
+Face redaction is not enabled by this workflow.
 """,
                 elem_classes=["primary-path-note"],
             )
 
-            with gr.Group(elem_classes=["step-card"]):
-                gr.Markdown(
-                    """
-### 1. Detect people
-
-FrameGuard scans the video with YuNet, tracks face appearances over time, and
-uses SFace to group track fragments that appear to belong to the same person.
-"""
-                )
-                extract_profiles_button = gr.Button(
-                    "Detect people in this video",
-                    variant="primary",
-                )
-                gallery_status = gr.Markdown(
-                    "Upload a video, then detect people.",
-                    elem_classes=["step-note"],
+            with gr.Group(elem_classes=["product-path"]):
+                gr.Markdown("### 1. Upload the source video")
+                secrets_video = gr.Video(
+                    label="Video containing sensitive content",
+                    sources=["upload"],
+                    format="mp4",
                 )
 
-            with gr.Group(elem_classes=["step-card"]):
-                gr.Markdown(
-                    """
-### 2. Review and choose people
-
-Click a face card to select or deselect that person. Selected cards receive a
-green border and a visible **SELECTED** banner. The gallery contains unique
-people, while the details panel reports how many raw track fragments were merged.
-"""
-                )
-                face_gallery = gr.Gallery(
-                    label="Detected unique people — click cards to select",
-                    columns=4,
-                    rows=2,
-                    height=620,
-                    object_fit="cover",
-                    preview=True,
-                    format="png",
-                )
-
-                gallery_action = gr.Radio(
-                    choices=[
-                        ("Blur the checked people", "blur_selected"),
-                        (
-                            "Keep the checked people visible and blur everyone else",
-                            "keep_selected_visible",
-                        ),
-                    ],
-                    value="blur_selected",
-                    type="value",
-                    label="What should FrameGuard do?",
-                )
-
-                gallery_choices = gr.CheckboxGroup(
-                    choices=[],
-                    label="Selected people",
-                    visible=False,
-                )
+            with gr.Group(elem_classes=["product-path"]):
+                gr.Markdown("### 2. Choose the protection checks")
                 with gr.Row():
-                    select_all_button = gr.Button("Check all")
-                    clear_selection_button = gr.Button("Clear checks")
-
-                selection_summary = gr.Markdown(
-                    "No face profiles have been extracted yet.",
+                    secret_deterministic_ocr = gr.Checkbox(
+                        value=True,
+                        label="Detect visible sensitive text",
+                        info=(
+                            "Emails, IP addresses, API keys, account IDs, "
+                            "phone numbers, and private URLs."
+                        ),
+                    )
+                    secret_detect_qr_codes = gr.Checkbox(
+                        value=True,
+                        label="Detect and redact QR codes",
+                    )
+                gr.Markdown(
+                    """
+Qwen2.5-Omni analyzes the visual and audio streams for semantic privacy
+findings. OCR and deterministic validators provide precise visible-text
+localization.
+""",
                     elem_classes=["step-note"],
                 )
 
-            with gr.Group(elem_classes=["step-card"]):
-                gr.Markdown(
-                    """
-### 3. Optional: use reference photos
-
-Upload clear photos when you already know which people should be blurred or
-protected. Preview the matches before rendering.
-"""
-                )
-                uploaded_reference_faces = gr.File(
-                    label="Reference photos",
-                    file_count="multiple",
-                    file_types=["image"],
-                    type="filepath",
-                )
-                uploaded_photo_action = gr.Radio(
-                    choices=[
-                        ("Add matching people to the blur list", "blur"),
-                        ("Keep matching people visible", "keep_visible"),
-                    ],
-                    value="blur",
-                    type="value",
-                    label="For people matching uploaded photos",
-                )
-                preview_matches_button = gr.Button("Preview photo matches")
-                uploaded_match_preview = gr.Code(
-                    label="Photo matches",
-                    language="json",
-                )
-
-            with gr.Group(elem_classes=["step-card"]):
-                gr.Markdown(
-                    """
-### 4. Create the protected video
-
-The final render also runs the configured video, audio, OCR, and QR privacy
-checks. It produces a redacted MP4, audit report, and privacy-safe run log.
-"""
-                )
-                render_gallery_button = gr.Button(
-                    "Create redacted video",
+            with gr.Group(elem_classes=["product-path"]):
+                gr.Markdown("### 3. Create the protected video")
+                protect_secrets_button = gr.Button(
+                    "Detect and redact sensitive content",
                     variant="primary",
                 )
 
-            with gr.Accordion("Face-detection details", open=False):
-                gallery_summary = gr.Code(
-                    label="Detected profile summary",
-                    language="json",
-                )
-
-        with gr.Tab("Automatic modes", id="automatic-modes"):
+        # ------------------------------------------------------------------
+        # 2. Face Privacy
+        # ------------------------------------------------------------------
+        with gr.Tab("Face Privacy", id="face-privacy"):
             gr.Markdown(
                 """
+## Blur faces in video
+
+Use the reviewed face gallery for predictable control. FrameGuard detects faces
+with YuNet, tracks appearances over time, and uses SFace to group fragmented
+tracks that appear to belong to the same person.
+""",
+                elem_classes=["primary-path-note"],
+            )
+
+            with gr.Group(elem_classes=["product-path"]):
+                gr.Markdown("### 1. Upload the source video")
+                faces_video = gr.Video(
+                    label="Video containing people",
+                    sources=["upload"],
+                    format="mp4",
+                )
+
+            with gr.Tabs():
+                # ----------------------------------------------------------
+                # Face Privacy: reviewed gallery
+                # ----------------------------------------------------------
+                with gr.Tab("Select People", id="face-select-people"):
+                    gr.Markdown(
+                        """
+### Reviewed face selection
+
+Detect unique people, click their profile cards, and choose whether selected
+people should be blurred or kept visible.
+"""
+                    )
+
+                    with gr.Group(elem_classes=["step-card"]):
+                        gr.Markdown("### 2. Detect unique people")
+                        extract_profiles_button = gr.Button(
+                            "Detect people in this video",
+                            variant="primary",
+                        )
+                        gallery_status = gr.Markdown(
+                            "Upload a video, then detect people.",
+                            elem_classes=["step-note"],
+                        )
+
+                    with gr.Group(elem_classes=["step-card"]):
+                        gr.Markdown(
+                            """
+### 3. Select people
+
+Click a face card to select or deselect it. Selected cards show a green border
+and a visible **SELECTED** banner.
+"""
+                        )
+                        face_gallery = gr.Gallery(
+                            label=(
+                                "Detected unique people — click cards to select"
+                            ),
+                            columns=4,
+                            rows=2,
+                            height=620,
+                            object_fit="cover",
+                            preview=True,
+                            format="png",
+                        )
+
+                        gallery_action = gr.Radio(
+                            choices=[
+                                (
+                                    "Blur the selected people",
+                                    "blur_selected",
+                                ),
+                                (
+                                    "Keep selected people visible and blur "
+                                    "everyone else",
+                                    "keep_selected_visible",
+                                ),
+                            ],
+                            value="blur_selected",
+                            type="value",
+                            label="Face privacy rule",
+                        )
+
+                        gallery_choices = gr.CheckboxGroup(
+                            choices=[],
+                            label="Selected people",
+                            visible=False,
+                        )
+                        with gr.Row():
+                            select_all_button = gr.Button("Select all")
+                            clear_selection_button = gr.Button(
+                                "Clear selection"
+                            )
+
+                        selection_summary = gr.Markdown(
+                            "No face profiles have been extracted yet.",
+                            elem_classes=["step-note"],
+                        )
+
+                    with gr.Group(elem_classes=["step-card"]):
+                        gr.Markdown(
+                            """
+### 4. Optional reference photos
+
+Upload one or more clear photos. FrameGuard matches them against the detected
+people and can either add the matches to the blur list or keep them visible.
+"""
+                        )
+                        uploaded_reference_faces = gr.File(
+                            label="Reference photos",
+                            file_count="multiple",
+                            file_types=["image"],
+                            type="filepath",
+                        )
+                        uploaded_photo_action = gr.Radio(
+                            choices=[
+                                (
+                                    "Blur people matching uploaded photos",
+                                    "blur",
+                                ),
+                                (
+                                    "Keep people matching uploaded photos "
+                                    "visible",
+                                    "keep_visible",
+                                ),
+                            ],
+                            value="blur",
+                            type="value",
+                            label="Uploaded-photo rule",
+                        )
+                        preview_matches_button = gr.Button(
+                            "Preview photo matches"
+                        )
+                        uploaded_match_preview = gr.Code(
+                            label="Photo matches",
+                            language="json",
+                        )
+
+                    with gr.Group(elem_classes=["step-card"]):
+                        gr.Markdown("### 5. Create the face-protected video")
+                        render_gallery_button = gr.Button(
+                            "Blur selected faces",
+                            variant="primary",
+                        )
+
+                    with gr.Accordion(
+                        "Face-detection details",
+                        open=False,
+                    ):
+                        gallery_summary = gr.Code(
+                            label="Detected profile summary",
+                            language="json",
+                        )
+
+                # ----------------------------------------------------------
+                # Face Privacy: automatic rules
+                # ----------------------------------------------------------
+                with gr.Tab("Automatic Rules", id="face-automatic-rules"):
+                    gr.Markdown(
+                        """
 ### Automatic face redaction
 
-Use these shortcuts when manual review is unnecessary. The child-only mode is
-experimental and should not be treated as a reliable determination of age.
+Use these shortcuts when reviewed profile selection is unnecessary. The
+child-only option remains experimental and is not a legal-age determination.
+"""
+                    )
+
+                    face_redaction_mode = gr.Radio(
+                        choices=[
+                            ("Blur every detected face", "all"),
+                            (
+                                "Blur one uploaded reference face",
+                                "reference",
+                            ),
+                            (
+                                "Blur visually apparent children "
+                                "(experimental)",
+                                "likely_minors",
+                            ),
+                        ],
+                        value="all",
+                        type="value",
+                        label="Automatic face rule",
+                    )
+
+                    with gr.Column(visible=False) as reference_face_panel:
+                        reference_face = gr.Image(
+                            label="Reference face",
+                            type="filepath",
+                            sources=["upload"],
+                            height=240,
+                        )
+
+                    with gr.Column(visible=False) as child_policy_panel:
+                        gr.Markdown(
+                            """
+**Experimental:** this mode makes a visual child/adult judgment from sampled
+video evidence. Review its audit output carefully.
+"""
+                        )
+                        with gr.Row():
+                            child_minimum_confidence = gr.Slider(
+                                minimum=0.50,
+                                maximum=0.95,
+                                step=0.01,
+                                value=0.70,
+                                label="Minimum timestamp confidence",
+                            )
+                            child_max_samples_per_track = gr.Slider(
+                                minimum=3,
+                                maximum=8,
+                                step=1,
+                                value=5,
+                                label="Maximum timestamps per track",
+                            )
+                        with gr.Row():
+                            child_minimum_usable_timestamps = gr.Slider(
+                                minimum=2,
+                                maximum=6,
+                                step=1,
+                                value=3,
+                                label="Minimum usable timestamps",
+                            )
+                            child_consensus_fraction = gr.Slider(
+                                minimum=0.50,
+                                maximum=1.00,
+                                step=0.05,
+                                value=0.70,
+                                label="Required temporal consensus",
+                            )
+                        child_blur_uncertain = gr.Checkbox(
+                            value=False,
+                            label="Also blur uncertain classifications",
+                        )
+                        child_continue_on_error = gr.Checkbox(
+                            value=True,
+                            label="Continue when classification fails",
+                        )
+
+                    automatic_button = gr.Button(
+                        "Apply automatic face redaction",
+                        variant="primary",
+                    )
+
+        # ------------------------------------------------------------------
+        # 3. Results
+        # ------------------------------------------------------------------
+        with gr.Tab("Results", id="results"):
+            gr.Markdown(
+                """
+## Protected output
+
+The latest completed workflow appears here with its redacted video, findings,
+audit report, metrics, and privacy-safe run log.
 """
             )
+            with gr.Row():
+                output_video = gr.Video(label="Protected video preview")
+                with gr.Column():
+                    redacted_download = gr.File(
+                        label="Download protected MP4"
+                    )
+                    report_download = gr.File(
+                        label="Download JSON audit report"
+                    )
+                    log_download = gr.File(
+                        label="Download privacy-safe run log"
+                    )
 
-            redact_faces = gr.Checkbox(
-                value=True,
-                label="Enable face redaction",
-            )
-            face_redaction_mode = gr.Radio(
-                choices=[
-                    ("Blur every detected face", "all"),
-                    ("Blur one uploaded reference face", "reference"),
-                    (
-                        "Blur visually apparent children (experimental)",
-                        "likely_minors",
-                    ),
+            findings = gr.Dataframe(
+                headers=[
+                    "Type",
+                    "Value",
+                    "Modality",
+                    "Confidence",
+                    "Start (s)",
+                    "End (s)",
+                    "Boxes",
+                    "Sources",
+                    "Action",
+                    "Reason",
                 ],
-                value="all",
-                type="value",
-                label="Automatic rule",
+                datatype=[
+                    "str",
+                    "str",
+                    "str",
+                    "number",
+                    "number",
+                    "number",
+                    "number",
+                    "str",
+                    "str",
+                    "str",
+                ],
+                interactive=False,
+                label="Privacy findings",
             )
 
-            with gr.Column(visible=False) as reference_face_panel:
-                reference_face = gr.Image(
-                    label="Reference face",
-                    type="filepath",
-                    sources=["upload"],
-                    height=240,
-                )
-
-            with gr.Column(visible=False) as child_policy_panel:
-                gr.Markdown(
-                    """
-**Experimental:** this is a visual child/adult judgment, not legal-age
-verification. Review the resulting audit report carefully.
-"""
-                )
+            with gr.Accordion("Metrics and audit preview", open=False):
                 with gr.Row():
-                    child_minimum_confidence = gr.Slider(
-                        minimum=0.50,
-                        maximum=0.95,
-                        step=0.01,
-                        value=0.70,
-                        label="Minimum timestamp confidence",
+                    metrics = gr.Code(
+                        label="Processing metrics",
+                        language="json",
                     )
-                    child_max_samples_per_track = gr.Slider(
-                        minimum=3,
-                        maximum=8,
-                        step=1,
-                        value=5,
-                        label="Maximum timestamps per track",
+                    report_preview = gr.Code(
+                        label="Audit report preview",
+                        language="json",
                     )
-                with gr.Row():
-                    child_minimum_usable_timestamps = gr.Slider(
-                        minimum=2,
-                        maximum=6,
-                        step=1,
-                        value=3,
-                        label="Minimum usable timestamps",
-                    )
-                    child_consensus_fraction = gr.Slider(
-                        minimum=0.50,
-                        maximum=1.00,
-                        step=0.05,
-                        value=0.70,
-                        label="Required temporal consensus",
-                    )
-                child_blur_uncertain = gr.Checkbox(
-                    value=False,
-                    label="Also blur uncertain classifications",
-                )
-                child_continue_on_error = gr.Checkbox(
-                    value=True,
-                    label="Continue when classification fails",
-                )
 
-            automatic_button = gr.Button(
-                "Run automatic analysis",
-                variant="primary",
-            )
-
+        # ------------------------------------------------------------------
+        # 4. Settings
+        # ------------------------------------------------------------------
         with gr.Tab("Settings", id="settings"):
             gr.Markdown(
                 """
-### Processing settings
+## Processing settings
 
-The defaults are appropriate for the supplied models. Change these values only
-when tuning detection, grouping, or model connectivity.
+These settings are shared by the two product workflows. The defaults are
+appropriate for the supplied models.
 """
             )
 
-            with gr.Accordion("Model connection", open=True):
+            with gr.Accordion("Qwen model connection", open=True):
                 api_base = gr.Textbox(
                     label="vLLM API base",
                     value=DEFAULT_API_BASE,
@@ -728,6 +931,15 @@ when tuning detection, grouping, or model connectivity.
                     step=1,
                     value=DEFAULT_CHUNK_SECONDS,
                     label="Qwen chunk length in seconds",
+                )
+
+            with gr.Accordion("Sensitive-content detection", open=True):
+                deterministic_sample_interval_ms = gr.Slider(
+                    minimum=200,
+                    maximum=1200,
+                    step=50,
+                    value=350,
+                    label="OCR and QR scan interval (ms)",
                 )
 
             with gr.Accordion("Face detection and matching", open=True):
@@ -754,7 +966,10 @@ when tuning detection, grouping, or model connectivity.
                         step=0.01,
                         value=0.40,
                         label="Gallery deduplication threshold",
-                        info="Raise when different people merge; lower when one person splits.",
+                        info=(
+                            "Raise when different people merge; lower when "
+                            "one person splits."
+                        ),
                     )
                 with gr.Row():
                     face_sample_interval_ms = gr.Slider(
@@ -787,14 +1002,7 @@ when tuning detection, grouping, or model connectivity.
                         label="Minimum observations per track",
                     )
 
-            with gr.Accordion("OCR, reporting, and diagnostics", open=False):
-                deterministic_sample_interval_ms = gr.Slider(
-                    minimum=200,
-                    maximum=1200,
-                    step=50,
-                    value=350,
-                    label="OCR and QR scan interval (ms)",
-                )
+            with gr.Accordion("Reporting and diagnostics", open=False):
                 run_log_level = gr.Dropdown(
                     choices=["INFO", "DEBUG"],
                     value="INFO",
@@ -809,52 +1017,41 @@ when tuning detection, grouping, or model connectivity.
                     label="Include raw Qwen output in the audit report",
                 )
 
-    gr.Markdown("---\n## Results")
-    with gr.Row():
-        output_video = gr.Video(label="Redacted preview")
-        with gr.Column():
-            redacted_download = gr.File(label="Redacted MP4")
-            report_download = gr.File(label="JSON audit report")
-            log_download = gr.File(label="Privacy-safe run log")
-
-    findings = gr.Dataframe(
-        headers=[
-            "Type",
-            "Value",
-            "Modality",
-            "Confidence",
-            "Start (s)",
-            "End (s)",
-            "Boxes",
-            "Sources",
-            "Action",
-            "Reason",
+    # ----------------------------------------------------------------------
+    # Sensitive-content events
+    # ----------------------------------------------------------------------
+    protect_secrets_button.click(
+        fn=run_sensitive_content_pipeline,
+        inputs=[
+            secrets_video,
+            api_base,
+            model,
+            chunk_seconds,
+            secret_deterministic_ocr,
+            secret_detect_qr_codes,
+            deterministic_sample_interval_ms,
+            run_log_level,
+            show_sensitive_values,
+            include_raw_model_output,
         ],
-        datatype=[
-            "str",
-            "str",
-            "str",
-            "number",
-            "number",
-            "number",
-            "number",
-            "str",
-            "str",
-            "str",
+        outputs=[
+            output_video,
+            redacted_download,
+            findings,
+            metrics,
+            report_preview,
+            report_download,
+            log_download,
         ],
-        interactive=False,
-        label="Privacy findings",
     )
 
-    with gr.Accordion("Metrics and audit preview", open=False):
-        with gr.Row():
-            metrics = gr.Code(label="Processing metrics", language="json")
-            report_preview = gr.Code(label="Audit report preview", language="json")
-
+    # ----------------------------------------------------------------------
+    # Face-gallery events
+    # ----------------------------------------------------------------------
     extract_profiles_button.click(
         fn=extract_face_profiles,
         inputs=[
-            input_video,
+            faces_video,
             face_model_path,
             face_recognition_model_path,
             face_sample_interval_ms,
@@ -879,19 +1076,31 @@ when tuning detection, grouping, or model connectivity.
     face_gallery.select(
         fn=toggle_gallery_profile,
         inputs=[gallery_state, gallery_choices, gallery_action],
-        outputs=[gallery_choices, face_gallery, selection_summary],
+        outputs=[
+            gallery_choices,
+            face_gallery,
+            selection_summary,
+        ],
     )
 
     select_all_button.click(
         fn=select_all_gallery_profiles,
         inputs=[gallery_state, gallery_action],
-        outputs=[gallery_choices, face_gallery, selection_summary],
+        outputs=[
+            gallery_choices,
+            face_gallery,
+            selection_summary,
+        ],
     )
 
     clear_selection_button.click(
         fn=clear_gallery_profiles,
         inputs=[gallery_state, gallery_action],
-        outputs=[gallery_choices, face_gallery, selection_summary],
+        outputs=[
+            gallery_choices,
+            face_gallery,
+            selection_summary,
+        ],
     )
 
     gallery_action.change(
@@ -915,7 +1124,7 @@ when tuning detection, grouping, or model connectivity.
     render_gallery_button.click(
         fn=run_gallery_pipeline,
         inputs=[
-            input_video,
+            faces_video,
             gallery_state,
             gallery_choices,
             gallery_action,
@@ -924,8 +1133,8 @@ when tuning detection, grouping, or model connectivity.
             api_base,
             model,
             chunk_seconds,
-            deterministic_ocr,
-            detect_qr_codes,
+            face_secret_ocr_disabled,
+            face_secret_qr_disabled,
             deterministic_sample_interval_ms,
             face_model_path,
             face_recognition_model_path,
@@ -945,6 +1154,9 @@ when tuning detection, grouping, or model connectivity.
         ],
     )
 
+    # ----------------------------------------------------------------------
+    # Automatic face events
+    # ----------------------------------------------------------------------
     face_redaction_mode.change(
         fn=update_automatic_mode,
         inputs=[face_redaction_mode],
@@ -954,14 +1166,14 @@ when tuning detection, grouping, or model connectivity.
     automatic_button.click(
         fn=run_pipeline,
         inputs=[
-            input_video,
+            faces_video,
             api_base,
             model,
             chunk_seconds,
-            deterministic_ocr,
-            detect_qr_codes,
+            face_secret_ocr_disabled,
+            face_secret_qr_disabled,
             deterministic_sample_interval_ms,
-            redact_faces,
+            face_redaction_enabled,
             face_model_path,
             face_sample_interval_ms,
             face_score_threshold,
