@@ -346,3 +346,41 @@ def test_small_face_child_consensus_does_not_blur() -> None:
     assert decision.category == "uncertain"
     assert decision.reason == "face_too_small_for_reliable_child_classification"
     assert decision.blur is False
+
+
+def test_one_clear_child_cue_per_timestamp_is_sufficient() -> None:
+    decision = decide_child_policy(
+        track_id="face_balanced_1",
+        assessments=[
+            assessment(1, "child", reason_codes=("childlike_face",)),
+            assessment(2, "child", reason_codes=("childlike_body_proportions",)),
+            assessment(3, "child", reason_codes=("childlike_face",)),
+        ],
+        sample_count=3,
+        minimum_usable_timestamps=3,
+        consensus_fraction=0.70,
+        median_face_width_px=96,
+    )
+    assert decision.category == "likely_minor"
+    assert decision.blur is True
+
+
+def test_uncertain_timestamps_do_not_dilute_decisive_child_consensus() -> None:
+    decision = decide_child_policy(
+        track_id="face_balanced_2",
+        assessments=[
+            assessment(1, "child", reason_codes=("childlike_face",)),
+            assessment(2, "child", reason_codes=("childlike_body_proportions",)),
+            assessment(3, "child", reason_codes=("childlike_face",)),
+            assessment(4, "uncertain", reason_codes=("insufficient_detail",)),
+            assessment(5, "uncertain", reason_codes=("profile_view",)),
+        ],
+        sample_count=5,
+        minimum_usable_timestamps=3,
+        consensus_fraction=0.70,
+        median_face_width_px=96,
+    )
+    assert decision.category == "likely_minor"
+    assert decision.blur is True
+    assert decision.child_votes == 3
+    assert decision.uncertain_votes == 2

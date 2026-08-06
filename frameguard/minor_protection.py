@@ -374,7 +374,7 @@ def decide_child_policy(
         codes = set(item.reason_codes)
         return (
             item.classification == "child"
-            and _CHILD_EVIDENCE_CODES.issubset(codes)
+            and bool(codes & _CHILD_EVIDENCE_CODES)
             and not (codes & _ADULT_EVIDENCE_CODES)
             and not (codes & _DISQUALIFYING_VISUAL_CODES)
         )
@@ -401,8 +401,9 @@ def decide_child_policy(
     child_votes = len(child_items)
     adult_votes = len(adult_items)
     uncertain_votes = len(uncertain_items)
-    child_fraction = child_votes / usable_count if usable_count else 0.0
-    adult_fraction = adult_votes / usable_count if usable_count else 0.0
+    decisive_votes = child_votes + adult_votes
+    child_fraction = child_votes / decisive_votes if decisive_votes else 0.0
+    adult_fraction = adult_votes / decisive_votes if decisive_votes else 0.0
 
     all_reason_codes = set(overall_reason_codes)
     for item in assessments:
