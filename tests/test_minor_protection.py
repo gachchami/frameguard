@@ -331,10 +331,27 @@ def test_limited_quality_child_votes_do_not_blur() -> None:
     assert decision.blur is False
 
 
-def test_small_face_child_consensus_does_not_blur() -> None:
-    reasons = ("childlike_face", "childlike_body_proportions")
+def test_small_face_with_body_consensus_can_blur() -> None:
+    reasons = ("childlike_body_proportions", "small_face")
     decision = decide_child_policy(
-        track_id="face_small",
+        track_id="face_small_child",
+        assessments=[
+            assessment(1, "child", reason_codes=reasons),
+            assessment(2, "child", reason_codes=reasons),
+            assessment(3, "child", reason_codes=reasons),
+        ],
+        sample_count=3,
+        median_face_width_px=42,
+    )
+    assert decision.category == "likely_minor"
+    assert decision.reason == "multi_timestamp_child_consensus"
+    assert decision.blur is True
+
+
+def test_small_face_without_body_evidence_remains_uncertain() -> None:
+    reasons = ("childlike_face", "small_face")
+    decision = decide_child_policy(
+        track_id="face_small_face_only",
         assessments=[
             assessment(1, "child", reason_codes=reasons),
             assessment(2, "child", reason_codes=reasons),
@@ -344,7 +361,22 @@ def test_small_face_child_consensus_does_not_blur() -> None:
         median_face_width_px=42,
     )
     assert decision.category == "uncertain"
-    assert decision.reason == "face_too_small_for_reliable_child_classification"
+    assert decision.blur is False
+
+
+def test_small_face_with_adult_body_consensus_stays_visible() -> None:
+    reasons = ("adult_body_proportions", "small_face")
+    decision = decide_child_policy(
+        track_id="face_small_adult",
+        assessments=[
+            assessment(1, "adult", reason_codes=reasons),
+            assessment(2, "adult", reason_codes=reasons),
+            assessment(3, "adult", reason_codes=reasons),
+        ],
+        sample_count=3,
+        median_face_width_px=42,
+    )
+    assert decision.category == "likely_adult"
     assert decision.blur is False
 
 
