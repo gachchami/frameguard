@@ -14,6 +14,10 @@ env.bak/
 venv.bak/
 
 # Dependencies
+node_modules/
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts
 .pytest_cache/
 .coverage
 htmlcov/
@@ -43,6 +47,7 @@ outputs/
 output/
 *.model
 *.weights
+models/
 
 # IDE & OS
 .vscode/
