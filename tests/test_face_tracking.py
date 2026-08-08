@@ -50,6 +50,27 @@ def test_face_tracker_separates_two_faces() -> None:
     assert sorted(len(track.observations) for track in tracker.tracks) == [2, 2]
 
 
+def test_face_tracker_does_not_reuse_track_across_scene_cut() -> None:
+    tracker = FaceTracker(frame_width=640, frame_height=360)
+
+    tracker.update(0, [FaceDetection(100, 80, 80, 100, 0.96)])
+    tracker.update(200, [FaceDetection(108, 82, 80, 100, 0.95)])
+    tracker.start_new_scene(400)
+    tracker.update(400, [FaceDetection(110, 84, 80, 100, 0.97)])
+
+    assert len(tracker.tracks) == 2
+    assert [len(track.observations) for track in tracker.tracks] == [2, 1]
+
+
+def test_face_tracker_rejects_impossible_jump_during_gradual_transition() -> None:
+    tracker = FaceTracker(frame_width=1280, frame_height=720)
+
+    tracker.update(4167, [FaceDetection(641, 249, 33, 58, 0.92)])
+    tracker.update(4583, [FaceDetection(537, 180, 42, 55, 0.92)])
+
+    assert len(tracker.tracks) == 2
+
+
 def test_finding_interpolates_observations() -> None:
     finding = Finding(
         id="finding_test",

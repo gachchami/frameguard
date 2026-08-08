@@ -22,7 +22,7 @@ those results before the MP4 is rendered.
 
 ## Privacy
 
-Face profile crops and SFace embeddings remain in the server-side Gradio
+Face profile crops and SFace embeddings remain in the server-side web
 session. They are not written into the JSON audit report or JSONL run log.
 The report records profile IDs, associated track IDs, selection actions, and
 uploaded-photo match scores.

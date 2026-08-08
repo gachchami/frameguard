@@ -100,6 +100,7 @@ command -v curl >/dev/null 2>&1 || fail "curl is required"
 command -v ffmpeg >/dev/null 2>&1 || fail "ffmpeg is required"
 command -v ffprobe >/dev/null 2>&1 || fail "ffprobe is required"
 command -v tesseract >/dev/null 2>&1 || fail "tesseract is required"
+command -v npm >/dev/null 2>&1 || fail "npm is required to build the React interface"
 
 cd "${REPO_ROOT}"
 
@@ -111,8 +112,6 @@ if [[ "${FRAMEGUARD_SYNC}" == "1" ]] || [[ ! -x "${REPO_ROOT}/.venv/bin/python" 
 fi
 
 # Prevent all optional telemetry and remote model lookups at runtime.
-export GRADIO_ANALYTICS_ENABLED=False
-export GRADIO_SHARE=False
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export HF_HUB_DISABLE_TELEMETRY=1
@@ -129,6 +128,10 @@ export FRAMEGUARD_FACE_RECOGNITION_MODEL="${FACE_RECOGNITION_MODEL}"
 export FRAMEGUARD_LOG_LEVEL
 export FRAMEGUARD_HOST
 export FRAMEGUARD_PORT
+
+log "Building the React interface..."
+npm --prefix "${REPO_ROOT}/frontend" install --no-audit --no-fund
+npm --prefix "${REPO_ROOT}/frontend" run build
 
 HEALTH_URL="http://${FRAMEGUARD_API_HOST}:${FRAMEGUARD_API_PORT}/health"
 MODELS_URL="http://${FRAMEGUARD_API_HOST}:${FRAMEGUARD_API_PORT}/v1/models"

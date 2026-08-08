@@ -15,17 +15,27 @@ def _extract_json_text(text: str) -> str:
     if fenced:
         stripped = fenced.group(1).strip()
 
-    array_start = stripped.find("[")
-    object_start = stripped.find("{")
-    starts = [position for position in (array_start, object_start) if position != -1]
+    starts = [index for index, character in enumerate(stripped) if character in "[{"]
     if not starts:
         raise ValueError("The model response did not contain JSON")
 
-    start = min(starts)
-    end = stripped.rfind("]" if stripped[start] == "[" else "}")
-    if end == -1 or end < start:
-        raise ValueError("The model response contained incomplete JSON")
-    return stripped[start : end + 1]
+    # Qwen occasionally appends an explanation or repeats its JSON response.
+    # Decode one complete value instead of slicing from the first opening token
+    # to the final closing token, which incorrectly joins those values together.
+    decoder = json.JSONDecoder()
+    last_error: json.JSONDecodeError | None = None
+    for start in starts:
+        try:
+            payload, end = decoder.raw_decode(stripped, start)
+        except json.JSONDecodeError as exc:
+            last_error = exc
+            continue
+        if isinstance(payload, (dict, list)):
+            return stripped[start:end]
+
+    if last_error is not None:
+        raise ValueError("The model response contained incomplete or invalid JSON") from last_error
+    raise ValueError("The model response did not contain a JSON object or array")
 
 
 def _number(value: Any, *, default: float = 0.0) -> float:
@@ -81,6 +91,13 @@ def parse_model_findings(text: str, clip_duration_seconds: float) -> list[ModelF
             continue
 
         kind = str(raw.get("type", "other")).strip().lower() or "other"
+        # Never turn the response-format example from the prompt into a real
+        # redaction if a backend echoes its input before the generated answer.
+        if "|" in kind or value.lower() in {
+            "exact sensitive value",
+            "exact sensitive value or concise description",
+        }:
+            continue
         modality = str(raw.get("modality", "visual")).strip().lower()
         if modality not in {"visual", "audio", "both"}:
             modality = "visual"

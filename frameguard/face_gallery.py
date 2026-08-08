@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass, replace
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Iterable, Literal, Sequence
+from typing import Any, Literal
 
 import cv2
 import numpy as np
@@ -25,6 +26,7 @@ class _TrackProfile:
     portrait_rgb: np.ndarray
     embedding: np.ndarray | None
     quality_score: float
+    preview_rgbs: list[np.ndarray] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -38,6 +40,7 @@ class FaceProfile:
     last_seen_ms: int
     observation_count: int
     mean_detector_confidence: float
+    preview_rgbs: list[np.ndarray] = field(default_factory=list)
 
     def public_summary(self) -> dict[str, object]:
         return {
@@ -98,7 +101,7 @@ class FaceGallerySession:
             "metrics": dict(self.metrics),
             "privacy": (
                 "Profile crops and SFace embeddings remain in the server-side "
-                "Gradio session and are not written to the report or JSONL log."
+                "web session and are not written to the report or JSONL log."
             ),
         }
 
@@ -284,8 +287,8 @@ def _read_frames_sequentially(
     return results
 
 
-def _portrait_card(crop_bgr: np.ndarray, *, size: int = 288) -> np.ndarray:
-    """Create a large, square RGB gallery image with the face filling the card."""
+def _portrait_card(crop_bgr: np.ndarray, *, size: int = 512) -> np.ndarray:
+    """Create a high-resolution gallery image without over-enlarging the face."""
 
     if crop_bgr.size == 0:
         return np.zeros((size, size, 3), dtype=np.uint8)
@@ -297,8 +300,18 @@ def _portrait_card(crop_bgr: np.ndarray, *, size: int = 288) -> np.ndarray:
     resized = cv2.resize(
         crop_bgr,
         (resized_width, resized_height),
-        interpolation=cv2.INTER_CUBIC,
+        interpolation=(
+            cv2.INTER_LANCZOS4
+            if scale > 1.0
+            else cv2.INTER_AREA
+        ),
     )
+
+    # A restrained unsharp mask restores edge contrast lost when a small video
+    # face is enlarged. It cannot invent detail, but it avoids the smeared look
+    # produced by a large browser-scaled thumbnail.
+    softened = cv2.GaussianBlur(resized, (0, 0), 0.8)
+    resized = cv2.addWeighted(resized, 1.18, softened, -0.18, 0)
 
     x1 = max(0, (resized_width - size) // 2)
     y1 = max(0, (resized_height - size) // 2)
@@ -537,6 +550,11 @@ def _profile_from_cluster(
             if observations
             else 0.0
         ),
+        preview_rgbs=[
+            image
+            for item in sorted(cluster, key=lambda row: row.quality_score, reverse=True)
+            for image in (item.preview_rgbs or [item.portrait_rgb])
+        ][:3],
     )
 
 
@@ -603,7 +621,9 @@ def scan_face_gallery(
             display_crop = _square_face_crop(
                 frame,
                 observation,
-                margin=0.18,
+                # Include hair, shoulders, and nearby clothing. Tiny faces are
+                # easier to distinguish with context than as extreme closeups.
+                margin=0.70,
             )
             if identity_crop.size == 0 or display_crop.size == 0:
                 continue
@@ -627,9 +647,10 @@ def scan_face_gallery(
             track_profiles.append(
                 _TrackProfile(
                     finding=finding,
-                    portrait_rgb=np.zeros((288, 288, 3), dtype=np.uint8),
+                    portrait_rgb=np.zeros((512, 512, 3), dtype=np.uint8),
                     embedding=None,
                     quality_score=0.0,
+                    preview_rgbs=[],
                 )
             )
             continue
@@ -637,6 +658,10 @@ def scan_face_gallery(
         candidate_rows.sort(key=lambda item: item[0], reverse=True)
         best_quality, _, _, best_display_crop = candidate_rows[0]
         portrait = _portrait_card(best_display_crop)
+        previews = [
+            _portrait_card(display_crop)
+            for _, _, _, display_crop in candidate_rows[:3]
+        ]
 
         weighted_embeddings: list[tuple[np.ndarray, float]] = []
         for quality, _, identity_crop, _ in candidate_rows[:3]:
@@ -653,6 +678,7 @@ def scan_face_gallery(
                 portrait_rgb=portrait,
                 embedding=_normalized_embedding_mean(weighted_embeddings),
                 quality_score=best_quality,
+                preview_rgbs=previews,
             )
         )
 
@@ -939,7 +965,7 @@ def _update_report(
         "purpose": "user-reviewed face selection",
         "privacy": (
             "Profile crops and SFace embeddings remain in memory for the current "
-            "Gradio session and are not embedded in this report."
+            "web session and are not embedded in this report."
         ),
         "selection_action": gallery_action,
         "uploaded_photo_action": uploaded_photo_action,

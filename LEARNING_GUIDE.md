@@ -10,7 +10,7 @@ Read the project in this order:
 6. `frameguard/visual_locator.py` — OCR is used for coordinates, not judgment.
 7. `frameguard/redact.py` — visual blur and audio muting.
 8. `frameguard/pipeline.py` — orchestration and duplicate merging.
-9. `app.py` — the Gradio interface around the pipeline.
+9. `frameguard/web.py` and `frontend/` — the FastAPI and React interface around the pipeline.
 
 ## The key design lesson
 

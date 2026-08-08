@@ -233,7 +233,7 @@ class FaceTracker:
         frame_height: int,
         max_gap_ms: int = 900,
         iou_threshold: float = 0.08,
-        center_distance_threshold: float = 0.18,
+        center_distance_threshold: float = 0.07,
         max_size_ratio: float = 3.0,
     ) -> None:
         self.frame_width = frame_width
@@ -244,16 +244,27 @@ class FaceTracker:
         self.max_size_ratio = float(max_size_ratio)
         self._tracks: list[_FaceTrack] = []
         self._next_track_number = 1
+        self._scene_started_ms = 0
 
     @property
     def tracks(self) -> list[_FaceTrack]:
         return self._tracks
+
+    @property
+    def scene_started_ms(self) -> int:
+        return self._scene_started_ms
+
+    def start_new_scene(self, time_ms: int) -> None:
+        """Prevent geometry-only tracks from crossing a hard video cut."""
+
+        self._scene_started_ms = max(self._scene_started_ms, int(time_ms))
 
     def update(self, time_ms: int, detections: list[FaceDetection]) -> None:
         active_tracks = [
             track
             for track in self._tracks
             if time_ms - track.last_observation.time_ms <= self.max_gap_ms
+            and track.last_observation.time_ms >= self._scene_started_ms
         ]
 
         candidates: list[tuple[float, int, int]] = []
@@ -429,6 +440,8 @@ def scan_face_tracks(
     reference_matches = 0
     reference_rejections = 0
     frame_index = 0
+    previous_sample_gray: np.ndarray | None = None
+    last_scene_cut_ms = -1000
     try:
         while True:
             ok, frame = capture.read()
@@ -442,6 +455,25 @@ def scan_face_tracks(
                 info.duration_ms,
                 int(round(frame_index / info.fps * 1000.0)),
             )
+            sample_gray = cv2.resize(
+                cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY),
+                (64, 36),
+                interpolation=cv2.INTER_AREA,
+            )
+            scene_change_score = (
+                float(cv2.absdiff(sample_gray, previous_sample_gray).mean())
+                if previous_sample_gray is not None
+                else 0.0
+            )
+            previous_sample_gray = sample_gray
+            is_scene_cut = (
+                scene_change_score >= 38.0
+                and time_ms - last_scene_cut_ms >= 800
+            )
+            if is_scene_cut:
+                tracker.start_new_scene(time_ms)
+                last_scene_cut_ms = time_ms
+
             all_detections = effective_detector.detect(frame)
             detection_count += len(all_detections)
             detections = all_detections
@@ -469,8 +501,11 @@ def scan_face_tracks(
                     time_ms=time_ms,
                     detections=len(all_detections),
                     detections_after_reference_filter=len(detections),
+                    scene_cut=is_scene_cut,
+                    scene_change_score=round(scene_change_score, 3),
                     active_tracks=sum(
                         time_ms - track.last_observation.time_ms <= max_track_gap_ms
+                        and track.last_observation.time_ms >= tracker.scene_started_ms
                         for track in tracker.tracks
                     ),
                     total_tracks=len(tracker.tracks),

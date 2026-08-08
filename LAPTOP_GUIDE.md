@@ -7,12 +7,12 @@ The laptop run has two separate goals:
 
 The included laptop smoke-test mode is **not an LLM**. It returns controlled
 findings for `samples/frameguard_demo.mp4` so you can test chunking, OCR boxes,
-visual blur, audio mute, the JSON report, and Gradio.
+visual blur, audio mute, the JSON report, and React interface.
 
 ## Install system tools
 
 ```bash
-brew install ffmpeg tesseract espeak-ng
+brew install uv ffmpeg tesseract espeak-ng node
 ```
 
 `espeak-ng` is only needed to regenerate the synthetic sample.
@@ -36,18 +36,20 @@ uv run ruff check .
 uv run python scripts/create_demo_video.py
 ```
 
-## Start FrameGuard
+## Start FrameGuard with the real Qwen model
 
 ```bash
-uv run python app.py
+./scripts/start-mac.sh
 ```
 
-Open `http://localhost:7860`, leave the detector set to
-**Laptop smoke test — no LLM**, upload `samples/frameguard_demo.mp4`, and run it.
+The launcher downloads and starts `Qwen/Qwen2.5-Omni-3B` locally on first use,
+then opens `http://localhost:7860`. Model loading can take several minutes.
+Qwen's official Transformers implementation handles the video's visual and
+audio streams together and uses Metal acceleration when available.
 
 ## What should work locally
 
-- Gradio UI
+- React UI and FastAPI backend
 - MP4 upload
 - FFmpeg chunking
 - OCR localization with Tesseract

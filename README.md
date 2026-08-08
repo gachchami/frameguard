@@ -98,7 +98,8 @@ age evidence.
 - FFmpeg and FFprobe
 - Tesseract OCR
 - `uv`
-- A ROCm-compatible vLLM environment for Qwen2.5-Omni
+- Linux: a ROCm-compatible vLLM environment for Qwen2.5-Omni
+- macOS: an Apple Silicon Mac with enough unified memory for Qwen2.5-Omni-3B
 
 ### Local models
 
@@ -108,8 +109,9 @@ models/face_detection_yunet_2023mar.onnx
 models/face_recognition_sface_2021dec.onnx
 ```
 
-The Qwen path can be overridden with `FRAMEGUARD_MODEL_PATH`. The YuNet and
-SFace paths can be overridden independently.
+The Linux Qwen path can be overridden with `FRAMEGUARD_MODEL_PATH`. On macOS,
+`FRAMEGUARD_MODEL` accepts a Hugging Face model ID or local checkpoint path.
+The YuNet and SFace paths can be overridden independently.
 
 ## Start
 
@@ -125,7 +127,7 @@ The script:
 1. Validates required tools and model files.
 2. Reuses an existing healthy vLLM server or starts one.
 3. Disables optional telemetry and remote model lookups.
-4. Starts FrameGuard with the repository's `uv` environment.
+4. Builds the React interface and starts the FastAPI application.
 5. Writes runtime logs under `outputs/runtime/`.
 
 Default endpoints:
@@ -144,16 +146,36 @@ FRAMEGUARD_PORT=7861 ./scripts/start.sh
 FRAMEGUARD_MODEL_PATH=/path/to/Qwen2.5-Omni-3B ./scripts/start.sh
 ```
 
+### macOS
+
+On an Apple Silicon Mac, the macOS launcher starts the real
+`Qwen/Qwen2.5-Omni-3B` model locally, waits for it to finish loading, and then
+opens FrameGuard:
+
+```bash
+./scripts/start-mac.sh
+```
+
+The first launch downloads the model checkpoint. Qwen2.5-Omni video inference
+requires substantial unified memory; close memory-intensive applications before
+starting it. An existing or remote OpenAI-compatible endpoint can still be used
+by setting `FRAMEGUARD_API_BASE` or `FRAMEGUARD_REMOTE_HOST`.
+
 | Variable | Default | Purpose |
 |---|---|---|
 | `FRAMEGUARD_MODEL_PATH` | Auto-detected | Local Qwen model directory |
 | `FRAMEGUARD_FACE_MODEL` | `models/face_detection_yunet_2023mar.onnx` | YuNet model |
 | `FRAMEGUARD_FACE_RECOGNITION_MODEL` | `models/face_recognition_sface_2021dec.onnx` | SFace model |
-| `FRAMEGUARD_HOST` | `127.0.0.1` | Gradio bind address |
-| `FRAMEGUARD_PORT` | `7860` | Gradio port |
+| `FRAMEGUARD_HOST` | `127.0.0.1` | Web application bind address |
+| `FRAMEGUARD_PORT` | `7860` | Web application port |
 | `FRAMEGUARD_API_PORT` | `8091` | Local vLLM port |
 | `FRAMEGUARD_LOG_LEVEL` | `INFO` | Application log level |
 | `FRAMEGUARD_SYNC` | `0` | Run `uv sync` before startup when set to `1` |
+| `FRAMEGUARD_START_LOCAL_QWEN` | `1` on macOS | Start full Qwen2.5-Omni locally |
+
+The face gallery uses a conservative `0.50` SFace identity-grouping threshold.
+Raise it when two different people are merged; lower it when one person appears
+as too many duplicate cards.
 
 ## Outputs
 
@@ -180,6 +202,7 @@ uv sync
 uv run pytest -q
 uv run ruff check .
 uv run python -m compileall -q app.py frameguard scripts
+cd frontend && npm install && npm run build
 ```
 
 Model validation:

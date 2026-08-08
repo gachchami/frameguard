@@ -47,7 +47,7 @@ def parse_log_level(value: str | None, *, default: str = "INFO") -> int:
 
 
 def configure_application_logging() -> None:
-    """Configure safe console logging once for the Gradio process.
+    """Configure safe console logging once for the web process.
 
     FrameGuard never writes model prompts, media data URIs, raw model responses,
     credentials, or detected values to the normal Python log stream.

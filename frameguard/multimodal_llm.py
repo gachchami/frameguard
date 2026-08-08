@@ -84,6 +84,10 @@ def _safe_server_error(body: object) -> tuple[str, str | None, int]:
         return "unknown", None, 0
     error = body.get("error")
     if not isinstance(error, dict):
+        detail = body.get("detail")
+        if detail:
+            message = str(detail)
+            return "server_error", None, len(message)
         return "unknown", None, 0
     error_type = str(error.get("type") or "unknown")
     code = error.get("code")

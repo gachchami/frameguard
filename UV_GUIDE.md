@@ -21,6 +21,14 @@ uv run ruff check .
 uv run python scripts/create_demo_video.py
 ```
 
+The web interface has a separate frontend build:
+
+```bash
+cd frontend
+npm install
+npm run build
+```
+
 `uv run` finds the project environment and executes the command inside it.
 
 ## Add a dependency
